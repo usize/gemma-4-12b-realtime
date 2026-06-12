@@ -67,6 +67,7 @@ class MotionController:
         self._stall_s = limits_cfg.get("watchdog_stall_ms", 200) / 1000.0
 
         self._prev = HeadOffset()
+        self._body_yaw = 0.0  # live body yaw (rad), updated each compose tick
         self._enabled_idle = idl.get("enabled", True)
         self._enabled_breath = br.get("enabled", True)
 
@@ -119,6 +120,18 @@ class MotionController:
     @property
     def head_yaw_deg(self) -> float:
         return self._posture_head.yaw
+
+    @property
+    def camera_yaw_deg(self) -> float:
+        """Where the camera is ACTUALLY pointed horizontally right now (deg) = body yaw +
+        the live composed head yaw (posture + idle/gaze/breathing). Used to cancel the
+        head's own motion when diffing camera frames."""
+        return math.degrees(self._body_yaw) + self._prev.yaw
+
+    @property
+    def camera_pitch_deg(self) -> float:
+        """Live composed head pitch (deg), including idle/breathing — see camera_yaw_deg."""
+        return self._prev.pitch
 
     def set_head_posture(self, *, x=None, y=None, z=None,
                          roll=None, pitch=None, yaw=None) -> None:

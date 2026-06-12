@@ -27,15 +27,46 @@ import time
 import numpy as np
 
 from rlb.audio.stream import MicStream, SileroSegmenter
-from rlb.cognition.prompt import assemble_messages, clean_reply
+from rlb.cognition.prompt import (
+    AMBIENT_DIRECTIVE,
+    SYSTEM_PROMPT,
+    assemble_messages,
+    clean_reply,
+    is_idle_reply,
+    system_with_activity,
+)
 from rlb.config import Config
 from rlb.embodiment import MotionSkills, read_state, skills_schema
 from rlb.inference import InferenceClient, image_part, text_part
 from rlb.motion import MotionController
 from rlb.search import find_and_center, search_tool
-from rlb.vision import frame_jpeg
+from rlb.vision import FrameWatcher, encode_jpeg, frame_jpeg
 
 log = logging.getLogger("rlb.orchestrator")
+
+
+def activity_tool() -> dict:
+    """Tool the model uses to start/stop a self-running activity (drives the heartbeat)."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "set_activity",
+            "description": (
+                "Start or stop an ongoing activity you run on your own — a game like Simon "
+                "Says, watching for something, following a moving object, etc. Pass a short "
+                "goal to START (then you'll get a turn every few seconds to look and act "
+                "without being spoken to); pass an empty goal to STOP when it's over."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string",
+                             "description": "what you're doing, e.g. 'play Simon Says as the "
+                                            "caller'; empty to stop"},
+                },
+                "required": ["goal"],
+            },
+        },
+    }
 
 
 class Orchestrator:
@@ -69,14 +100,24 @@ class Orchestrator:
         )
         self.history: list[dict] = []
         self._speaking = threading.Event()
+        # Heartbeat: an activity the model sets to keep acting on its own (see _tick).
+        self._activity: str | None = None
+        self._last_cognition = time.monotonic()
+        # Cheap pre-filter so an empty/static scene costs nothing (ego-motion compensated).
+        self._watcher = (
+            FrameWatcher(cfg.motion.camera_hfov_deg, cfg.motion.camera_vfov_deg,
+                         threshold=cfg.cognition.heartbeat_motion_threshold)
+            if cfg.cognition.heartbeat_diff else None
+        )
 
     # ---- one cognition turn -------------------------------------------------
     async def _respond(self, user_text: str, image_jpeg: bytes | None = None) -> str:
-        """Agentic turn: the model may call movement skills, then speaks.
+        """Agentic turn: the model may call movement/activity skills, then speaks.
 
         Movement tool calls execute immediately (routed through the controller) and we
         loop back so the model produces a spoken reply. The last iteration drops tools so
-        it must answer with words. Tool round-trips are NOT persisted to history.
+        it must answer with words. Tool round-trips are NOT persisted to history; the
+        caller persists the user/assistant pair.
         """
         # Report the controller's COMMANDED heading/head (stable, and the only source of
         # body_yaw — the SDK read leaves it None), so the model can reason about relative
@@ -89,14 +130,15 @@ class Orchestrator:
         parts = [text_part(user_text)]
         if image_jpeg:
             parts.append(image_part(image_jpeg))  # so it actually sees, not confabulates
-        messages = assemble_messages(self.history, parts, state_line=state)
-        tools = skills_schema() + [search_tool()]
+        system = system_with_activity(self._activity) if self._activity else SYSTEM_PROMPT
+        messages = assemble_messages(self.history, parts, state_line=state, system=system)
+        tools = skills_schema() + [search_tool(), activity_tool()]
         max_iters = 3
         reply = ""
         async with InferenceClient(self.cfg.inference) as ic:
             for i in range(max_iters):
                 use_tools = tools if i < max_iters - 1 else None
-                out = await ic.complete(messages, tools=use_tools, max_tokens=120, temperature=0.6)
+                out = await ic.complete(messages, tools=use_tools, temperature=0.6)
                 if use_tools and out.tool_calls:
                     messages.append({
                         "role": "assistant",
@@ -108,25 +150,34 @@ class Orchestrator:
                         ],
                     })
                     for tc in out.tool_calls:
-                        if tc.name == "find_and_face":
-                            # An async perception loop (turn/look/center), not a one-shot
-                            # move, so it's run here rather than via the sync dispatcher.
-                            result = await find_and_center(
-                                ic, self.motion, self.session.mini,
-                                str(tc.arguments.get("target", "")), cfg=self.cfg)
-                        else:
-                            result = self.skills.execute(tc.name, tc.arguments)
+                        result = await self._dispatch(ic, tc)
                         log.info("skill %s(%s) -> %s", tc.name, tc.arguments, result)
                         messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                     continue
                 reply = clean_reply(out.text)
                 break
+        return reply
 
+    async def _dispatch(self, ic, tc) -> str:
+        """Run a single tool call, routing the non-motion ones that need orchestrator state."""
+        if tc.name == "find_and_face":
+            # An async perception loop (turn/look/center), not a one-shot move.
+            return await find_and_center(
+                ic, self.motion, self.session.mini,
+                str(tc.arguments.get("target", "")), cfg=self.cfg)
+        if tc.name == "set_activity":
+            goal = str(tc.arguments.get("goal", "")).strip()
+            self._activity = goal or None
+            self._last_cognition = time.monotonic()  # don't tick until the interval passes
+            log.info("activity %s", f"set: {goal}" if goal else "cleared")
+            return f"activity set: {goal}" if goal else "activity cleared"
+        return self.skills.execute(tc.name, tc.arguments)
+
+    def _remember(self, user_text: str, reply: str) -> None:
         self.history.append({"role": "user", "content": user_text})
         self.history.append({"role": "assistant", "content": reply})
         if len(self.history) > 20:
             self.history = self.history[-20:]
-        return reply
 
     def _speak(self, text: str) -> bool:
         """Speak in interruptible chunks; return True if the user barged in.
@@ -194,12 +245,15 @@ class Orchestrator:
         try:
             while not stop_event.is_set():
                 frame = self.mic.read(timeout=0.1)
-                if frame is None:
-                    continue
-                if self._speaking.is_set():
-                    continue  # echo avoidance (barge-in will replace this)
-                for utt in self.segmenter.push(frame):
-                    self._handle_utterance(utt)
+                if not self._speaking.is_set() and frame is not None:
+                    for utt in self.segmenter.push(frame):
+                        self._handle_utterance(utt)
+                # Ambient heartbeat: whenever no one is talking, glance at the camera every
+                # cfg.cognition.heartbeat_s and react only if something needs it.
+                if (not self._speaking.is_set()
+                        and not self.segmenter.in_speech
+                        and time.monotonic() - self._last_cognition >= self.cfg.cognition.heartbeat_s):
+                    self._tick()
         finally:
             stop_event.set()
             self.mic.stop()
@@ -219,5 +273,35 @@ class Orchestrator:
         print(f"\n🧑 {user_text}")
         jpeg = frame_jpeg(self.session.mini, max_px=self.cfg.inference.max_image_px)
         reply = asyncio.run(self._respond(user_text, image_jpeg=jpeg))
+        self._remember(user_text, reply)
+        self._last_cognition = time.monotonic()
         print(f"🤖 {reply}")
         self._speak(reply)
+
+    def _tick(self) -> None:
+        """Ambient heartbeat: glance at the camera and react only if something warrants it.
+
+        Runs whenever no one is talking (every cfg.cognition.heartbeat_s), in the main loop
+        thread so cognition stays serialized with spoken turns. A '(wait)' / empty reply
+        means 'nothing to react to' and is neither spoken nor remembered, so history stays
+        to real exchanges and the robot doesn't chatter.
+        """
+        frame = self.session.mini.media.get_frame()
+        # Cheap pre-filter: skip the LLM unless the scene changed (cancelling head motion).
+        if self._watcher is not None:
+            changed, diff = self._watcher.changed(
+                frame, self.motion.camera_yaw_deg, self.motion.camera_pitch_deg)
+            if not changed:
+                log.debug("heartbeat: no scene change (diff=%.3f), skipping", diff)
+                self._last_cognition = time.monotonic()
+                return
+        jpeg = encode_jpeg(frame, max_px=self.cfg.inference.max_image_px)
+        if jpeg is None:                       # dark/blocked frame — nothing to evaluate
+            self._last_cognition = time.monotonic()
+            return
+        reply = asyncio.run(self._respond(AMBIENT_DIRECTIVE, image_jpeg=jpeg))
+        if not is_idle_reply(reply):
+            self._remember("(noticed something)", reply)
+            print(f"🤖 {reply}")
+            self._speak(reply)
+        self._last_cognition = time.monotonic()  # next glance is heartbeat_s after this one

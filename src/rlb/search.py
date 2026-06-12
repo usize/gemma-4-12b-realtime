@@ -102,7 +102,7 @@ async def _locate(ic, jpeg: bytes | None, target: str) -> tuple[float, float] | 
         f"with ONLY the word: no"
     )
     msgs = [{"role": "user", "content": [text_part(prompt), image_part(jpeg)]}]
-    out = await ic.complete(msgs, max_tokens=24, temperature=0.0)
+    out = await ic.complete(msgs, max_tokens=48, temperature=0.0)
     txt = (out.text or "").strip().lower()
     nums = _NUMS.findall(txt)
     if "no" in txt and len(nums) < 2:

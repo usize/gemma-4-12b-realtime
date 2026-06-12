@@ -5,15 +5,17 @@
 inference:
   # OpenAI-compatible endpoint. Works with llama.cpp server, LM Studio, vLLM, or MLX.
   # Location is a config value, not an architectural decision (plan §0.3).
-  base_url: "http://localhost:8080/v1"
+  base_url: "http://localhost:8081/v1"   # llama.cpp VL server (Qwen3.6-27B, vision-capable)
   api_key: "not-needed-for-local"
-  model: "mlx-community/gemma-4-12B-it-4bit"
+  model: "Qwen3.6-27B-Q4_K_S.gguf"
   request_timeout_s: 120.0
   connect_timeout_s: 5.0
   # Latency-budget knobs (plan §1.2) — tune empirically with scripts/bench_latency.py.
   max_image_px: 768       # longest edge of attached frames
   max_audio_seconds: 30.0 # clip length cap for an utterance
   stream: true
+  max_tokens: 256         # reasoning models need room; was empty replies at 120
+  disable_thinking: true  # Qwen3 reasons before answering — suppress it for a snappy robot
 
 robot:
   # "default" = LOCAL/GStreamer media backend (daemon + client on same Mac, plan §2.1).

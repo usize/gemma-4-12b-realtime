@@ -62,6 +62,38 @@ SYSTEM_PROMPT = (
 )
 
 
+# Heartbeat: when no one is talking, Reachy glances at the camera every few seconds and
+# decides whether anything warrants a response. This directive is the synthetic "user" turn
+# that drives that glance; IDLE_REPLY is what it says when nothing needs a reaction.
+IDLE_REPLY = "(wait)"
+AMBIENT_DIRECTIVE = (
+    "No one is speaking right now. Look at the current camera image and decide if anything "
+    "needs your attention — someone looking at you or gesturing to you, something you were "
+    "asked to watch for, or a game in progress. If so, react: say one short line and/or "
+    f"move. If nothing needs a response, reply with exactly {IDLE_REPLY} and nothing else."
+)
+
+
+def system_with_activity(activity: str) -> str:
+    """System prompt augmented for a self-running activity (a game, watching, etc.)."""
+    return (
+        f"{SYSTEM_PROMPT} You are currently doing this on your own, checking every few "
+        f"seconds: {activity}. Each turn, look at the image and EITHER take your next "
+        f"action and/or say one short line, OR if nothing should happen yet reply with "
+        f"exactly {IDLE_REPLY} and nothing else."
+    )
+
+
+def is_idle_reply(text: str) -> bool:
+    """True when a (heartbeat) reply means 'do/say nothing this tick'."""
+    s = (text or "").strip()
+    if not s:
+        return True
+    if s.startswith("(") and s.endswith(")"):   # a parenthetical aside, e.g. "(waiting…)"
+        return True
+    return s.strip("().!?…").lower() in ("wait", "pass", "nothing", "waiting", "no")
+
+
 def state_block(state_line: str) -> str:
     return f"<robot_state>{state_line}</robot_state>"
 

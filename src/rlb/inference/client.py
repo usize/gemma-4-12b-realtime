@@ -127,9 +127,12 @@ class InferenceClient:
             "messages": messages,
             "stream": True,
             "temperature": temperature,
+            "max_tokens": max_tokens if max_tokens is not None else self.cfg.max_tokens,
         }
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
+        if self.cfg.disable_thinking:
+            # llama.cpp/Qwen3: suppress the hidden reasoning pass (saves the token budget
+            # and latency that was otherwise returning empty content).
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"

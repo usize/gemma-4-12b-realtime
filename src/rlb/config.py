@@ -29,6 +29,10 @@ class InferenceConfig(BaseModel):
     max_image_px: int = 768
     max_audio_seconds: float = 30.0
     stream: bool = True
+    max_tokens: int = 256          # default completion budget (reasoning models need room)
+    # Qwen3/“thinking” models reason before answering, which burns the budget and adds
+    # latency. When true, the client sends chat_template_kwargs.enable_thinking=false.
+    disable_thinking: bool = False
 
 
 class RobotConfig(BaseModel):
@@ -125,6 +129,13 @@ class CognitionConfig(BaseModel):
     memory_db: str = "data/memory.sqlite"
     max_tool_iters_per_turn: int = 6
     wake_mode: str = "always"  # always | wakeword | look_to_talk
+    # Ambient heartbeat: when no one is talking, glance at the camera every this-many
+    # seconds and react only if something warrants it (see Orchestrator._tick).
+    heartbeat_s: float = 3.0
+    # Cheap pre-filter: only spend an LLM call on a glance when the scene actually changed
+    # (ego-motion-compensated frame diff). Threshold is mean abs pixel change in [0,1].
+    heartbeat_diff: bool = True
+    heartbeat_motion_threshold: float = 0.06
 
 
 class ToolsConfig(BaseModel):
