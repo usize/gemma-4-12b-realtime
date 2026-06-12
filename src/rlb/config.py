@@ -102,6 +102,15 @@ class TtsConfig(BaseModel):
 class MotionConfig(BaseModel):
     layers: dict[str, Any] = Field(default_factory=dict)
     limits: dict[str, Any] = Field(default_factory=dict)
+    # Body-first orientation dynamics: the head leads toward a new heading, the body
+    # rotates to catch up, and the head re-centers as it arrives.
+    body_lead_tau_s: float = 0.55     # body easing time-constant (lower = snappier body)
+    head_lead_gain: float = 0.6       # head lead as a fraction of remaining heading error
+    head_lead_max_deg: float = 18.0   # cap on the transient head lead
+    # Camera intrinsics used to turn an object's image position into a heading (point_at).
+    camera_hfov_deg: float = 70.0     # horizontal field of view
+    camera_vfov_deg: float = 42.0     # vertical field of view
+    antenna_point_deg: float = 35.0   # max antenna lean toward a pointed-at object
 
 
 class PerceptionConfig(BaseModel):

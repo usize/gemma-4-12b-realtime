@@ -32,6 +32,7 @@ from rlb.config import Config
 from rlb.embodiment import MotionSkills, read_state, skills_schema
 from rlb.inference import InferenceClient, image_part, text_part
 from rlb.motion import MotionController
+from rlb.search import find_and_center, search_tool
 from rlb.vision import frame_jpeg
 
 log = logging.getLogger("rlb.orchestrator")
@@ -77,12 +78,19 @@ class Orchestrator:
         loop back so the model produces a spoken reply. The last iteration drops tools so
         it must answer with words. Tool round-trips are NOT persisted to history.
         """
-        state = read_state(self.session.mini).line()
+        # Report the controller's COMMANDED heading/head (stable, and the only source of
+        # body_yaw — the SDK read leaves it None), so the model can reason about relative
+        # turns ("more to the right") instead of guessing absolute angles blind.
+        st = read_state(self.session.mini)
+        st.body_yaw = self.motion.heading_deg
+        st.yaw = self.motion.head_yaw_deg
+        st.pitch = self.motion.head_pitch_deg
+        state = st.line()
         parts = [text_part(user_text)]
         if image_jpeg:
             parts.append(image_part(image_jpeg))  # so it actually sees, not confabulates
         messages = assemble_messages(self.history, parts, state_line=state)
-        tools = skills_schema()
+        tools = skills_schema() + [search_tool()]
         max_iters = 3
         reply = ""
         async with InferenceClient(self.cfg.inference) as ic:
@@ -100,7 +108,14 @@ class Orchestrator:
                         ],
                     })
                     for tc in out.tool_calls:
-                        result = self.skills.execute(tc.name, tc.arguments)
+                        if tc.name == "find_and_face":
+                            # An async perception loop (turn/look/center), not a one-shot
+                            # move, so it's run here rather than via the sync dispatcher.
+                            result = await find_and_center(
+                                ic, self.motion, self.session.mini,
+                                str(tc.arguments.get("target", "")), cfg=self.cfg)
+                        else:
+                            result = self.skills.execute(tc.name, tc.arguments)
                         log.info("skill %s(%s) -> %s", tc.name, tc.arguments, result)
                         messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
                     continue

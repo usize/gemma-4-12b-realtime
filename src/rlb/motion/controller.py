@@ -19,6 +19,7 @@ import time
 
 from rlb.config import Config
 from rlb.motion.layers import (
+    BodyOrientation,
     BreathingLayer,
     GazeLayer,
     IdleScanLayer,
@@ -38,6 +39,7 @@ class MotionController:
     def __init__(self, session, cfg: Config) -> None:
         self.session = session
         self.mini = session.mini
+        self.cfg = cfg
         self.hz = cfg.robot.control_hz
         layers = cfg.motion.layers or {}
         limits_cfg = cfg.motion.limits or {}
@@ -51,6 +53,12 @@ class MotionController:
         self.idle = IdleScanLayer(period_s=idl.get("period_s", 4.0))
         self.gaze = GazeLayer(tau_s=gz.get("smooth_tau_s", 0.25))
         self.speech = SpeechReactiveLayer(gain=sp.get("gain", 0.6))
+        # Body-first horizontal aim: head leads, body catches up, head re-centers.
+        self.body = BodyOrientation(
+            tau_s=cfg.motion.body_lead_tau_s,
+            lead_gain=cfg.motion.head_lead_gain,
+            lead_max_deg=cfg.motion.head_lead_max_deg,
+        )
 
         self.limits = Limits()
         # Map max angular velocity (deg/s) to a per-tick yaw step fraction.
@@ -62,9 +70,18 @@ class MotionController:
         self._enabled_idle = idl.get("enabled", True)
         self._enabled_breath = br.get("enabled", True)
 
-        # Commanded-gesture layer (plan §4.2 top priority): when active it dominates the
-        # idle/gaze base so LLM movement skills actually move the head, without anyone
-        # calling goto_target behind the 100 Hz loop's back.
+        # Persistent posture (the new "home" the live animation rides on): an orientation
+        # the model sets that HOLDS until changed/reset, rather than a gesture that relaxes
+        # back. Breathing + gentle idle/gaze animate gently around it. Head posture is in
+        # controller-native units (m / deg); antenna posture is a (left, right) radian
+        # offset from neutral; horizontal heading lives in self.body.
+        self._posture_head = HeadOffset()
+        self._posture_ant: tuple[float, float] = (0.0, 0.0)
+
+        # Commanded-gesture layer (plan §4.2 top priority): a TRANSIENT pose that dominates
+        # for hold_s then releases — for expressive emotes that should relax back (distinct
+        # from posture, which persists). Lets LLM gestures move without anyone calling
+        # goto_target behind the 100 Hz loop's back.
         self._cmd_head: HeadOffset | None = None
         self._cmd_ant: tuple[float, float] = (0.0, 0.0)
         self._cmd_body: float | None = None  # degrees
@@ -80,7 +97,7 @@ class MotionController:
     def command(self, *, head: HeadOffset | None = None,
                 antennas: tuple[float, float] | None = None,
                 body_yaw_deg: float | None = None, hold_s: float = 3.5) -> None:
-        """Request a commanded pose that dominates the blend for `hold_s` seconds."""
+        """Request a TRANSIENT pose that dominates the blend for `hold_s` seconds (emote)."""
         if head is not None:
             self._cmd_head = head
         if antennas is not None:
@@ -88,6 +105,47 @@ class MotionController:
         if body_yaw_deg is not None:
             self._cmd_body = body_yaw_deg
         self._cmd_expiry = time.perf_counter() + hold_s
+
+    # ---- persistent posture (holds until changed; animation rides on top) ----
+    @property
+    def heading_deg(self) -> float:
+        """Current body heading in degrees (where the body is actually pointed)."""
+        return self.body.pos
+
+    @property
+    def head_pitch_deg(self) -> float:
+        return self._posture_head.pitch
+
+    @property
+    def head_yaw_deg(self) -> float:
+        return self._posture_head.yaw
+
+    def set_head_posture(self, *, x=None, y=None, z=None,
+                         roll=None, pitch=None, yaw=None) -> None:
+        """Set the persistent head posture (controller units: m / deg). None axes hold."""
+        c = self._posture_head
+        self._posture_head = HeadOffset(
+            x=c.x if x is None else x, y=c.y if y is None else y,
+            z=c.z if z is None else z, roll=c.roll if roll is None else roll,
+            pitch=c.pitch if pitch is None else pitch,
+            yaw=c.yaw if yaw is None else yaw,
+        )
+
+    def set_antenna_posture(self, *, left_rad=None, right_rad=None) -> None:
+        """Set the persistent antenna posture (radian offset from neutral). None holds."""
+        l, r = self._posture_ant
+        self._posture_ant = (l if left_rad is None else left_rad,
+                             r if right_rad is None else right_rad)
+
+    def set_body_orientation(self, deg: float) -> None:
+        """Set the persistent absolute body heading; head leads, body catches up."""
+        self.body.set_target_deg(deg)
+
+    def reset_posture(self) -> None:
+        """Clear posture back to neutral / forward-facing."""
+        self._posture_head = HeadOffset()
+        self._posture_ant = (0.0, 0.0)
+        self.body.set_target_deg(0.0)
 
     # ---- the loop ----
     def run(self, stop_event: threading.Event) -> None:
@@ -126,19 +184,24 @@ class MotionController:
         breathing_h, self._br_ant = (
             self.breathing.update(t) if self._enabled_breath else (HeadOffset(), (0.0, 0.0))
         )
-        gaze_h, gaze_body, presence = self.gaze.update(t, dt)
+        gaze_h, _gaze_body, presence = self.gaze.update(t, dt)
         speech_h, self._sp_ant = self.speech.update(t, dt)
+
+        # Body-first heading: the body owns horizontal aim; the head gets a transient lead
+        # toward a new heading that decays to zero as the body catches up (head re-centers).
+        body_pos, head_lead = self.body.update(dt)
 
         cmd_active = time.perf_counter() < self._cmd_expiry
         if cmd_active and self._cmd_head is not None:
-            base = self._cmd_head           # commanded gesture dominates idle/gaze
+            base = self._cmd_head           # transient emote dominates posture/idle/gaze
         else:
             idle_h = self.idle.update(t) if self._enabled_idle else HeadOffset()
-            base = _lerp(idle_h, gaze_h, presence)
+            anim = _lerp(idle_h, gaze_h, presence)   # gentle life around the held posture
+            base = self._posture_head + anim + HeadOffset(yaw=head_lead)
         if cmd_active and self._cmd_body is not None:
             self._body_yaw = math.radians(self._cmd_body)
         else:
-            self._body_yaw = gaze_body
+            self._body_yaw = math.radians(body_pos)
 
         head = breathing_h + base + speech_h
         head = self.limits.clamp(head)
@@ -148,7 +211,7 @@ class MotionController:
 
     def _antennas(self) -> tuple[float, float]:
         cmd_ant = self._cmd_ant if time.perf_counter() < self._cmd_expiry else (0.0, 0.0)
-        targets = antenna_targets(self._br_ant, self._sp_ant, cmd_ant)
+        targets = antenna_targets(self._br_ant, self._sp_ant, cmd_ant, self._posture_ant)
         return targets[0], targets[1]
 
     def _safe_neutral(self) -> None:

@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rlb.motion.pose import ANTENNA_NEUTRAL, HeadOffset
+from rlb.motion.pose import ANTENNA_NEUTRAL
 
 # Head workspace, in model-facing units (cm / degrees). Conservative; matches motion.Limits.
 HEAD_RANGE = {
@@ -28,6 +28,36 @@ HEAD_RANGE = {
 }
 BODY_YAW_RANGE = (-90.0, 90.0)        # deg
 ANTENNA_RANGE = (-50.0, 50.0)         # deg around neutral
+
+# Camera/point fallbacks when no Config is available (otherwise MotionConfig wins).
+DEFAULT_HFOV = 70.0
+DEFAULT_VFOV = 42.0
+DEFAULT_ANT_POINT = 35.0
+
+
+def _fov(cfg) -> tuple[float, float, float]:
+    if cfg is not None:
+        m = cfg.motion
+        return m.camera_hfov_deg, m.camera_vfov_deg, m.antenna_point_deg
+    return DEFAULT_HFOV, DEFAULT_VFOV, DEFAULT_ANT_POINT
+
+
+def _point_solution(u: float, v: float, *, hfov: float, vfov: float, ant_gain: float):
+    """Map an object's image position to (az_off_deg, el_off_deg, (lean_l_deg, lean_r_deg)).
+
+    `u`: 0=left edge .. 1=right edge; `v`: 0=top .. 1=bottom (image convention). Azimuth
+    uses the head-yaw sign convention (left positive), elevation uses pitch (down
+    positive). The antenna on the object's side leans forward and the other back, so the
+    silhouette tilts toward the target — a single-DoF antenna can't pan, so this is the
+    readable "gesturing toward it" lean rather than a literal pointer.
+    """
+    u = min(1.0, max(0.0, u))
+    v = min(1.0, max(0.0, v))
+    az_off = -(u - 0.5) * hfov          # object right (u>0.5) -> turn right (yaw negative)
+    el_off = (v - 0.5) * vfov           # object low (v>0.5)  -> pitch down (positive)
+    mag = ant_gain * min(1.0, abs(u - 0.5) * 2.0)
+    lean = (-mag, mag) if u >= 0.5 else (mag, -mag)   # (left, right) degrees
+    return az_off, el_off, lean
 
 
 @dataclass
@@ -82,9 +112,10 @@ class EmbodimentSkills:
     model can say "tilt your head left 10 degrees" without restating the whole pose.
     """
 
-    def __init__(self, session) -> None:
+    def __init__(self, session, cfg=None) -> None:
         self.session = session
         self.mini = session.mini
+        self.cfg = cfg
 
     # ---- skills -------------------------------------------------------------
     def set_head(self, *, x=None, y=None, z=None, roll=None, pitch=None, yaw=None,
@@ -127,10 +158,25 @@ class EmbodimentSkills:
         self.mini.goto_target(body_yaw=float(np.radians(deg)), duration=duration)
         return f"body_yaw -> {deg:+.0f}"
 
+    def turn_body(self, degrees: float, duration: float = 0.6) -> str:
+        """Turn relative to the current heading (left+/right-)."""
+        cur = read_state(self.mini).body_yaw or 0.0
+        return self.set_body_yaw(cur + degrees, duration=duration)
+
     def look_at(self, x: float, y: float, z: float, duration: float = 1.0) -> str:
         """Point the head at a 3D point in the robot's frame (metres)."""
         self.mini.look_at_world(x, y, z, duration=duration)
         return f"look_at -> ({x},{y},{z})"
+
+    def point_at(self, u: float, v: float, duration: float = 0.8) -> str:
+        """Turn to face an object seen at image position (u,v) and lean antennas toward it."""
+        hfov, vfov, gain = _fov(self.cfg)
+        az, el, (la, ra) = _point_solution(u, v, hfov=hfov, vfov=vfov, ant_gain=gain)
+        cur = read_state(self.mini)
+        self.set_body_yaw(az, duration=duration)
+        self.set_head(pitch=_clamp(cur.pitch + el, *HEAD_RANGE["pitch"]), duration=duration)
+        self.set_antennas(left=la, right=ra, duration=0.4)
+        return f"point_at -> (u={u:.2f}, v={v:.2f})"
 
     def reset_pose(self, duration: float = 0.6) -> str:
         """Return to the neutral 'looking straight ahead' pose."""
@@ -148,52 +194,71 @@ class EmbodimentSkills:
         return fn(**args)
 
 
-_SKILL_NAMES = {"set_head", "set_antennas", "set_body_yaw", "look_at", "reset_pose"}
+_SKILL_NAMES = {"set_head", "set_antennas", "set_body_yaw", "turn_body",
+                "look_at", "point_at", "reset_pose"}
 
 
 class MotionSkills:
     """Same skills as EmbodimentSkills, but routed through the live MotionController.
 
-    Used inside the conversation loop, where the 100 Hz controller owns head motion: a
-    skill sets a *commanded gesture* (top-priority layer held a few seconds) instead of
-    calling goto_target directly, so they never fight. Model units (cm/deg) are converted
-    to the controller's HeadOffset (m/deg).
+    Used inside the conversation loop, where the 100 Hz controller owns motion. Moves set
+    the controller's *persistent posture* — they HOLD until changed or reset, with
+    breathing/idle/gaze animating gently around them, instead of relaxing back. Horizontal
+    aim is body-first: the head leads toward a new heading and the body catches up. Model
+    units (cm/deg) convert to controller units (m/deg/rad).
     """
 
-    def __init__(self, controller, hold_s: float = 4.0) -> None:
+    def __init__(self, controller) -> None:
         self.c = controller
-        self.hold_s = hold_s
-
-    def _head_offset(self, x=None, y=None, z=None, roll=None, pitch=None, yaw=None) -> HeadOffset:
-        g = lambda v, k: _clamp(v, *HEAD_RANGE[k]) if v is not None else 0.0  # noqa: E731
-        return HeadOffset(
-            x=g(x, "x") / 100, y=g(y, "y") / 100, z=g(z, "z") / 100,
-            roll=g(roll, "roll"), pitch=g(pitch, "pitch"), yaw=g(yaw, "yaw"),
-        )
 
     def set_head(self, *, x=None, y=None, z=None, roll=None, pitch=None, yaw=None) -> str:
-        self.c.command(head=self._head_offset(x, y, z, roll, pitch, yaw), hold_s=self.hold_s)
-        return "moving head"
+        def cv(v, k, scale=1.0):  # clamp to range, scale units; None = hold
+            return None if v is None else _clamp(v, *HEAD_RANGE[k]) * scale
+        self.c.set_head_posture(
+            x=cv(x, "x", 0.01), y=cv(y, "y", 0.01), z=cv(z, "z", 0.01),  # cm -> m
+            roll=cv(roll, "roll"), pitch=cv(pitch, "pitch"), yaw=cv(yaw, "yaw"),
+        )
+        return "head set"
 
     def set_antennas(self, *, left=None, right=None) -> str:
-        l = _clamp(left if left is not None else 0.0, *ANTENNA_RANGE)
-        r = _clamp(right if right is not None else 0.0, *ANTENNA_RANGE)
-        self.c.command(antennas=(math.radians(l), math.radians(r)), hold_s=self.hold_s)
-        return "moving antennas"
+        self.c.set_antenna_posture(
+            left_rad=None if left is None else math.radians(_clamp(left, *ANTENNA_RANGE)),
+            right_rad=None if right is None else math.radians(_clamp(right, *ANTENNA_RANGE)),
+        )
+        return "antennas set"
 
     def set_body_yaw(self, degrees: float) -> str:
-        self.c.command(body_yaw_deg=_clamp(degrees, *BODY_YAW_RANGE), hold_s=self.hold_s)
-        return "turning body"
+        deg = _clamp(degrees, *BODY_YAW_RANGE)
+        self.c.set_body_orientation(deg)
+        return f"facing {deg:+.0f}"
+
+    def turn_body(self, degrees: float) -> str:
+        """Turn relative to the current heading (left+/right-)."""
+        deg = _clamp(self.c.heading_deg + degrees, *BODY_YAW_RANGE)
+        self.c.set_body_orientation(deg)
+        return f"turned to {deg:+.0f}"
 
     def look_at(self, x: float, y: float, z: float) -> str:
-        # Robot frame: x forward, y left, z up -> head yaw/pitch.
+        # Robot frame: x forward, y left, z up. Horizontal -> body heading (body-first),
+        # vertical -> head pitch.
         yaw = math.degrees(math.atan2(y, x))
         pitch = -math.degrees(math.atan2(z, math.hypot(x, y) + 1e-6))
-        self.c.command(head=self._head_offset(yaw=yaw, pitch=pitch), hold_s=self.hold_s)
+        self.c.set_body_orientation(_clamp(yaw, *BODY_YAW_RANGE))
+        self.c.set_head_posture(pitch=_clamp(pitch, *HEAD_RANGE["pitch"]))
         return "looking there"
 
+    def point_at(self, u: float, v: float) -> str:
+        hfov, vfov, gain = _fov(self.c.cfg)
+        az, el, (la, ra) = _point_solution(u, v, hfov=hfov, vfov=vfov, ant_gain=gain)
+        # Heading is relative to where the body currently points; pitch relative to the head.
+        self.c.set_body_orientation(_clamp(self.c.heading_deg + az, *BODY_YAW_RANGE))
+        self.c.set_head_posture(
+            pitch=_clamp(self.c.head_pitch_deg + el, *HEAD_RANGE["pitch"]))
+        self.c.set_antenna_posture(left_rad=math.radians(la), right_rad=math.radians(ra))
+        return f"pointing (u={u:.2f}, v={v:.2f})"
+
     def reset_pose(self) -> str:
-        self.c.command(head=HeadOffset(), antennas=(0.0, 0.0), body_yaw_deg=0.0, hold_s=2.0)
+        self.c.reset_posture()
         return "back to neutral"
 
     def execute(self, name: str, args: dict) -> str:
@@ -208,25 +273,31 @@ def skills_schema() -> list[dict]:
         return {"type": "number", "description": desc}
 
     return [
-        _tool("set_head", "Move the head. Provide only the axes to change; omitted axes hold. "
-              "Translations in cm, rotations in degrees.", {
-                  "x": num("left(-)/right(+) cm, [-2,2]"),
-                  "y": num("back(-)/forward(+) cm, [-2,2]"),
-                  "z": num("down(-)/up(+) cm, [-1.5,1.5]"),
-                  "roll": num("tilt degrees, [-15,15]"),
-                  "pitch": num("look down(+)/up(-) degrees, [-20,20]"),
-                  "yaw": num("turn left(+)/right(-) degrees, [-30,30]"),
-              }),
-        _tool("set_antennas", "Set antenna angles in degrees relative to neutral, [-50,50].", {
-            "left": num("left antenna degrees"),
-            "right": num("right antenna degrees"),
+        _tool("set_head", "Tilt/nod/glance the head; holds. Only pass axes to change.", {
+            "x": num("left(-)/right(+) cm"),
+            "y": num("back(-)/forward(+) cm"),
+            "z": num("down(-)/up(+) cm"),
+            "roll": num("tilt deg"),
+            "pitch": num("down(+)/up(-) deg"),
+            "yaw": num("small turn left(+)/right(-) deg"),
         }),
-        _tool("set_body_yaw", "Rotate the whole body to an absolute yaw in degrees, [-90,90].",
+        _tool("set_antennas", "Set antenna angles, degrees from neutral [-50,50]; holds.", {
+            "left": num("left deg"), "right": num("right deg"),
+        }),
+        _tool("set_body_yaw", "Face an absolute body heading (deg [-90,90], 0=forward, "
+              "left+/right-); holds.",
               {"degrees": num("absolute body yaw")}, required=["degrees"]),
-        _tool("look_at", "Aim the head at a 3D point in the robot's frame (metres).", {
-            "x": num("metres forward"), "y": num("metres left"), "z": num("metres up"),
+        _tool("turn_body", "Turn relative to where you're facing now: positive=left, "
+              "negative=right (deg). Use for 'turn more', 'a bit left'. Holds.",
+              {"degrees": num("relative turn, left+/right-")}, required=["degrees"]),
+        _tool("look_at", "Aim at a 3D point in the robot frame (metres); holds.", {
+            "x": num("fwd m"), "y": num("left m"), "z": num("up m"),
         }, required=["x", "y", "z"]),
-        _tool("reset_pose", "Return head and body to neutral.", {}),
+        _tool("point_at", "Point at an object in the camera image; holds.", {
+            "u": num("image x, 0 left .. 1 right"),
+            "v": num("image y, 0 top .. 1 bottom"),
+        }, required=["u", "v"]),
+        _tool("reset_pose", "Return to neutral, facing forward.", {}),
     ]
 
 

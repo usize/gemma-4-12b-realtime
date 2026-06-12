@@ -101,6 +101,40 @@ class GazeLayer:
         return head, self._body_yaw, self._presence
 
 
+class BodyOrientation:
+    """Body-first horizontal aim with a leading head (the user's chosen feel).
+
+    `set_target_deg(h)` requests an absolute heading. Each tick the *body* eases toward it
+    over `tau_s` (it's the slow, grounded DoF), while the *head* gets a transient lead
+    proportional to the remaining error — so the head darts toward a new heading first,
+    the body rotates to catch up, and the head re-centers as the error closes. Returns
+    `(body_yaw_deg, head_lead_deg)`; the controller drives the body and adds the lead to
+    the head offset.
+    """
+
+    def __init__(self, tau_s: float = 0.55, lead_gain: float = 0.6,
+                 lead_max_deg: float = 18.0, limit_deg: float = 90.0) -> None:
+        self.tau = max(tau_s, 1e-3)
+        self.lead_gain = lead_gain
+        self.lead_max = lead_max_deg
+        self.limit = limit_deg
+        self._target = 0.0
+        self._pos = 0.0
+
+    @property
+    def pos(self) -> float:
+        return self._pos
+
+    def set_target_deg(self, deg: float) -> None:
+        self._target = max(-self.limit, min(self.limit, deg))
+
+    def update(self, dt: float) -> tuple[float, float]:
+        err = self._target - self._pos
+        self._pos += err * min(1.0, dt / self.tau)
+        lead = max(-self.lead_max, min(self.lead_max, self.lead_gain * err))
+        return self._pos, lead
+
+
 class SpeechReactiveLayer:
     """Head bobs + antenna motion modulated by the TTS audio envelope while speaking."""
 

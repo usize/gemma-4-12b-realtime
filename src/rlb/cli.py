@@ -160,7 +160,7 @@ def logs(
 @app.command()
 def chat(
     greeting: str = typer.Option(
-        "Hi! I'm Reachy. It's lovely to see you. What's on your mind?",
+        "",
         help="Spoken on startup; empty to skip.",
     ),
 ) -> None:
@@ -249,7 +249,7 @@ def embody(
     cfg = load_config()
     with connect(cfg, use_sim=sim) as sess:
         sess.mini.wake_up()
-        skills = EmbodimentSkills(sess)
+        skills = EmbodimentSkills(sess, cfg)
         before = read_state(sess.mini)
         console.print(f"[dim]state:[/] {before.line()}")
 
