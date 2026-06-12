@@ -1,0 +1,103 @@
+# Reachy Local Brain — single source of truth for endpoints, backends, and tunables.
+# Every value here is overridable by an env var of the form RLB_<SECTION>__<KEY>
+# (double underscore = nesting), so secrets/host-specific bits can stay out of git.
+
+inference:
+  # OpenAI-compatible endpoint. Works with llama.cpp server, LM Studio, vLLM, or MLX.
+  # Location is a config value, not an architectural decision (plan §0.3).
+  base_url: "http://localhost:8080/v1"
+  api_key: "not-needed-for-local"
+  model: "mlx-community/gemma-4-12B-it-4bit"
+  request_timeout_s: 120.0
+  connect_timeout_s: 5.0
+  # Latency-budget knobs (plan §1.2) — tune empirically with scripts/bench_latency.py.
+  max_image_px: 768       # longest edge of attached frames
+  max_audio_seconds: 30.0 # clip length cap for an utterance
+  stream: true
+
+robot:
+  # "default" = LOCAL/GStreamer media backend (daemon + client on same Mac, plan §2.1).
+  media_backend: "default"
+  # "real" uses the USB-tethered robot via the daemon; "mujoco" runs the sim backend.
+  backend: "real"
+  control_hz: 100.0       # motion blender loop rate (plan §4.2)
+
+audio:
+  sample_rate: 16000
+  channels: 1
+  # Prefer the robot mic via the SDK; fall back to the Mac mic via sounddevice.
+  source: "robot"         # robot | mac
+  mic_gain: 8.0           # ReSpeaker is low-level; boost before VAD/ASR
+  # Gemma 4 native audio is broken in mlx-vlm 0.6.3, so we transcribe first.
+  # Flip to "native" (one line) once upstream audio works.
+  input_mode: "asr"       # asr | native
+    # ASR runs as an HTTP service in the ML venv (see `ml` section).
+  asr:
+    model: "mlx-community/parakeet-tdt-0.6b-v3"
+    language: "en"
+    host: "127.0.0.1"
+    port: 8123
+  vad:
+    backend: "silero"     # silero (proven) | energy (legacy)
+    trailing_silence_ms: 700   # Silero endpointing silence (plan §2.2)
+    min_utterance_ms: 250
+    threshold: 0.5        # Silero speech probability (raise if noise triggers; lower if it misses)
+    speech_pad_ms: 200
+    start_factor: 3.5     # (energy backend only)
+    end_factor: 2.0
+    abs_floor: 0.0025
+
+tts:
+  # Qwen3-TTS (instruction-following) served from the ML venv; voice "aiden" (user pick).
+  # The `instruct` line is the style/emotion dial — the orchestrator can vary it per turn.
+  backend: "qwen3-tts"
+  model: "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-bf16"
+  voice: "aiden"
+  instruct: "Speak in a warm, androgynous, gently robotic voice with subtle excitement and curiosity."
+  speed: 1.44             # client-side playback speedup (slight pitch rise); user pref
+  sink: "robot"           # robot | mac
+  host: "127.0.0.1"
+  port: 8124
+
+motion:
+  # Layer gains for the blender (plan §4.2). 0..1 weights, top priority wins.
+  layers:
+    breathing: { enabled: true,  amplitude: 0.4 }
+    speech_reactive: { enabled: true, gain: 0.6 }
+    gaze: { enabled: true, smooth_tau_s: 0.25, saccade_threshold_deg: 12 }
+    idle_scan: { enabled: true, period_s: 4.0 }
+  limits:
+    max_head_vel_dps: 180.0   # rate-limit set_target deltas
+    watchdog_stall_ms: 200    # neutral-pose fallback if loop stalls
+
+perception:
+  enabled: true
+  face_backend: "mediapipe"   # mediapipe | yolo
+  target_fps: 20
+  scene_tick_s: 0.0           # Tier-B ambient awareness; 0 disables (plan §1.3)
+
+cognition:
+  rolling_summary_turns: 10
+  memory_db: "data/memory.sqlite"
+  max_tool_iters_per_turn: 6
+  wake_mode: "always"         # always | wakeword | look_to_talk (plan §2.4)
+
+tools:
+  ring2_enabled: false        # coding harness off until Phase 4
+  workspace_dir: "data/workspace"
+  ring2_auto_approve: []      # tool names trusted to skip the verbal "yes" gate
+
+ml:
+  # Separate venv with the MLX model stack (hf-hub>=1.0, conflicts with reachy_mini).
+  # The inference (LLM) and ASR services launch from here; everything else uses .venv.
+  venv: ".venv-ml"
+
+bus:
+  transport: "zmq"            # zmq | inproc
+  # Per-service endpoints; tcp on loopback keeps it restartable across processes.
+  pub_endpoint: "tcp://127.0.0.1:5555"
+  cmd_endpoint: "tcp://127.0.0.1:5556"
+
+logging:
+  level: "INFO"
+  data_dir: "data"

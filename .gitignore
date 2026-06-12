@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Local config — never commit secrets
+.env
+
+# Model caches
+.cache/
+models/
+
+# Runtime state (pids, logs, sqlite, workspace)
+data/
+
+# macOS
+.DS_Store
