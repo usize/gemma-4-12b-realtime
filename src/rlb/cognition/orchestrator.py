@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -28,7 +29,7 @@ import numpy as np
 from rlb.audio.stream import MicStream, SileroSegmenter
 from rlb.cognition.prompt import assemble_messages, clean_reply
 from rlb.config import Config
-from rlb.embodiment import read_state
+from rlb.embodiment import MotionSkills, read_state, skills_schema
 from rlb.inference import InferenceClient, image_part, text_part
 from rlb.motion import MotionController
 from rlb.vision import frame_jpeg
@@ -46,6 +47,7 @@ class Orchestrator:
         self.tts = TtsClient(cfg.tts, robot_session=session)
         self.asr = Transcriber(cfg.audio.asr)
         self.motion = MotionController(session, cfg)
+        self.skills = MotionSkills(self.motion)  # movement routed through the controller
         self.mic = MicStream(session, sample_rate=cfg.audio.sample_rate, gain=cfg.audio.mic_gain)
         self.segmenter = SileroSegmenter(
             sample_rate=cfg.audio.sample_rate,
@@ -69,14 +71,42 @@ class Orchestrator:
 
     # ---- one cognition turn -------------------------------------------------
     async def _respond(self, user_text: str, image_jpeg: bytes | None = None) -> str:
+        """Agentic turn: the model may call movement skills, then speaks.
+
+        Movement tool calls execute immediately (routed through the controller) and we
+        loop back so the model produces a spoken reply. The last iteration drops tools so
+        it must answer with words. Tool round-trips are NOT persisted to history.
+        """
         state = read_state(self.session.mini).line()
         parts = [text_part(user_text)]
         if image_jpeg:
             parts.append(image_part(image_jpeg))  # so it actually sees, not confabulates
         messages = assemble_messages(self.history, parts, state_line=state)
+        tools = skills_schema()
+        max_iters = 3
+        reply = ""
         async with InferenceClient(self.cfg.inference) as ic:
-            out = await ic.complete(messages, max_tokens=120, temperature=0.6)
-        reply = clean_reply(out.text)
+            for i in range(max_iters):
+                use_tools = tools if i < max_iters - 1 else None
+                out = await ic.complete(messages, tools=use_tools, max_tokens=120, temperature=0.6)
+                if use_tools and out.tool_calls:
+                    messages.append({
+                        "role": "assistant",
+                        "content": out.text or "",
+                        "tool_calls": [
+                            {"id": tc.id, "type": "function",
+                             "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)}}
+                            for tc in out.tool_calls
+                        ],
+                    })
+                    for tc in out.tool_calls:
+                        result = self.skills.execute(tc.name, tc.arguments)
+                        log.info("skill %s(%s) -> %s", tc.name, tc.arguments, result)
+                        messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                    continue
+                reply = clean_reply(out.text)
+                break
+
         self.history.append({"role": "user", "content": user_text})
         self.history.append({"role": "assistant", "content": reply})
         if len(self.history) > 20:

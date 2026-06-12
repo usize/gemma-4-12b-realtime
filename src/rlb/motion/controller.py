@@ -13,6 +13,7 @@ overruns; on stop we ease back to neutral via `goto_target`.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 
@@ -61,12 +62,32 @@ class MotionController:
         self._enabled_idle = idl.get("enabled", True)
         self._enabled_breath = br.get("enabled", True)
 
-    # ---- external inputs (called from bus wiring) ----
+        # Commanded-gesture layer (plan §4.2 top priority): when active it dominates the
+        # idle/gaze base so LLM movement skills actually move the head, without anyone
+        # calling goto_target behind the 100 Hz loop's back.
+        self._cmd_head: HeadOffset | None = None
+        self._cmd_ant: tuple[float, float] = (0.0, 0.0)
+        self._cmd_body: float | None = None  # degrees
+        self._cmd_expiry = 0.0
+
+    # ---- external inputs (called from bus wiring / skills) ----
     def set_gaze_target(self, off: HeadOffset | None) -> None:
         self.gaze.set_target(off)
 
     def set_speech_level(self, level: float) -> None:
         self.speech.set_level(level)
+
+    def command(self, *, head: HeadOffset | None = None,
+                antennas: tuple[float, float] | None = None,
+                body_yaw_deg: float | None = None, hold_s: float = 3.5) -> None:
+        """Request a commanded pose that dominates the blend for `hold_s` seconds."""
+        if head is not None:
+            self._cmd_head = head
+        if antennas is not None:
+            self._cmd_ant = antennas
+        if body_yaw_deg is not None:
+            self._cmd_body = body_yaw_deg
+        self._cmd_expiry = time.perf_counter() + hold_s
 
     # ---- the loop ----
     def run(self, stop_event: threading.Event) -> None:
@@ -105,18 +126,29 @@ class MotionController:
         breathing_h, self._br_ant = (
             self.breathing.update(t) if self._enabled_breath else (HeadOffset(), (0.0, 0.0))
         )
-        idle_h = self.idle.update(t) if self._enabled_idle else HeadOffset()
-        gaze_h, self._body_yaw, presence = self.gaze.update(t, dt)
+        gaze_h, gaze_body, presence = self.gaze.update(t, dt)
         speech_h, self._sp_ant = self.speech.update(t, dt)
 
-        head = breathing_h + _lerp(idle_h, gaze_h, presence) + speech_h
+        cmd_active = time.perf_counter() < self._cmd_expiry
+        if cmd_active and self._cmd_head is not None:
+            base = self._cmd_head           # commanded gesture dominates idle/gaze
+        else:
+            idle_h = self.idle.update(t) if self._enabled_idle else HeadOffset()
+            base = _lerp(idle_h, gaze_h, presence)
+        if cmd_active and self._cmd_body is not None:
+            self._body_yaw = math.radians(self._cmd_body)
+        else:
+            self._body_yaw = gaze_body
+
+        head = breathing_h + base + speech_h
         head = self.limits.clamp(head)
         head = self.limits.slew(self._prev, head)
         self._prev = head
         return head
 
     def _antennas(self) -> tuple[float, float]:
-        targets = antenna_targets(self._br_ant, self._sp_ant)
+        cmd_ant = self._cmd_ant if time.perf_counter() < self._cmd_expiry else (0.0, 0.0)
+        targets = antenna_targets(self._br_ant, self._sp_ant, cmd_ant)
         return targets[0], targets[1]
 
     def _safe_neutral(self) -> None:

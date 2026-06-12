@@ -14,11 +14,12 @@ for an LLM than metres/radians); we convert at the boundary.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
 
-from rlb.motion.pose import ANTENNA_NEUTRAL
+from rlb.motion.pose import ANTENNA_NEUTRAL, HeadOffset
 
 # Head workspace, in model-facing units (cm / degrees). Conservative; matches motion.Limits.
 HEAD_RANGE = {
@@ -148,6 +149,57 @@ class EmbodimentSkills:
 
 
 _SKILL_NAMES = {"set_head", "set_antennas", "set_body_yaw", "look_at", "reset_pose"}
+
+
+class MotionSkills:
+    """Same skills as EmbodimentSkills, but routed through the live MotionController.
+
+    Used inside the conversation loop, where the 100 Hz controller owns head motion: a
+    skill sets a *commanded gesture* (top-priority layer held a few seconds) instead of
+    calling goto_target directly, so they never fight. Model units (cm/deg) are converted
+    to the controller's HeadOffset (m/deg).
+    """
+
+    def __init__(self, controller, hold_s: float = 4.0) -> None:
+        self.c = controller
+        self.hold_s = hold_s
+
+    def _head_offset(self, x=None, y=None, z=None, roll=None, pitch=None, yaw=None) -> HeadOffset:
+        g = lambda v, k: _clamp(v, *HEAD_RANGE[k]) if v is not None else 0.0  # noqa: E731
+        return HeadOffset(
+            x=g(x, "x") / 100, y=g(y, "y") / 100, z=g(z, "z") / 100,
+            roll=g(roll, "roll"), pitch=g(pitch, "pitch"), yaw=g(yaw, "yaw"),
+        )
+
+    def set_head(self, *, x=None, y=None, z=None, roll=None, pitch=None, yaw=None) -> str:
+        self.c.command(head=self._head_offset(x, y, z, roll, pitch, yaw), hold_s=self.hold_s)
+        return "moving head"
+
+    def set_antennas(self, *, left=None, right=None) -> str:
+        l = _clamp(left if left is not None else 0.0, *ANTENNA_RANGE)
+        r = _clamp(right if right is not None else 0.0, *ANTENNA_RANGE)
+        self.c.command(antennas=(math.radians(l), math.radians(r)), hold_s=self.hold_s)
+        return "moving antennas"
+
+    def set_body_yaw(self, degrees: float) -> str:
+        self.c.command(body_yaw_deg=_clamp(degrees, *BODY_YAW_RANGE), hold_s=self.hold_s)
+        return "turning body"
+
+    def look_at(self, x: float, y: float, z: float) -> str:
+        # Robot frame: x forward, y left, z up -> head yaw/pitch.
+        yaw = math.degrees(math.atan2(y, x))
+        pitch = -math.degrees(math.atan2(z, math.hypot(x, y) + 1e-6))
+        self.c.command(head=self._head_offset(yaw=yaw, pitch=pitch), hold_s=self.hold_s)
+        return "looking there"
+
+    def reset_pose(self) -> str:
+        self.c.command(head=HeadOffset(), antennas=(0.0, 0.0), body_yaw_deg=0.0, hold_s=2.0)
+        return "back to neutral"
+
+    def execute(self, name: str, args: dict) -> str:
+        if name not in _SKILL_NAMES:
+            return f"unknown skill {name!r}"
+        return getattr(self, name)(**args)
 
 
 def skills_schema() -> list[dict]:
