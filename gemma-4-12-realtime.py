@@ -17,8 +17,8 @@ Optional (TTS):
 Run:
     python gemma_realtime_server.py
     python gemma_realtime_server.py --host 0.0.0.0 --port 8765
-    python gemma_realtime_server.py --device cpu   # if MPS causes issues
-    python gemma_realtime_server.py --debug        # verbose VAD logging
+    python gemma_realtime_server.py --device cpu
+    python gemma_realtime_server.py --debug
 """
 
 from __future__ import annotations
@@ -67,9 +67,13 @@ parser.add_argument("--device", default="mps",
 parser.add_argument("--host",   default="0.0.0.0")
 parser.add_argument("--port",   type=int, default=8765)
 parser.add_argument("--max-history-turns", type=int, default=20)
-parser.add_argument("--vad-threshold",     type=float, default=0.5)
+parser.add_argument("--vad-threshold",     type=float, default=0.4)
 parser.add_argument("--vad-silence-ms",    type=int,   default=700)
 parser.add_argument("--max-audio-secs",    type=int,   default=28)
+# How long after sending audio output to suppress VAD (avoid mic echo pickup).
+# Tune this to match your robot's speaker-to-mic delay + TTS duration estimate.
+parser.add_argument("--echo-suppress-ms",  type=int,   default=800,
+                    help="Suppress VAD for this many ms after sending audio response")
 parser.add_argument("--debug", action="store_true",
                     help="Enable debug logging (shows per-chunk VAD probabilities)")
 args = parser.parse_args()
@@ -85,16 +89,17 @@ logging.basicConfig(
 log = logging.getLogger("gemma-realtime")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Constants (from parsed args)
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL_ID          = args.model
-DEVICE            = args.device
-SAMPLE_RATE       = 16_000          # Gemma expects 16 kHz mono float32
-MAX_AUDIO_SECS    = args.max_audio_secs
-MAX_NEW_TOKENS    = 512
-VAD_THRESHOLD     = args.vad_threshold
-VAD_SILENCE_MS    = args.vad_silence_ms
-MAX_HISTORY_TURNS = args.max_history_turns
+MODEL_ID           = args.model
+DEVICE             = args.device
+SAMPLE_RATE        = 16_000
+MAX_AUDIO_SECS     = args.max_audio_secs
+MAX_NEW_TOKENS     = 512
+VAD_THRESHOLD      = args.vad_threshold
+VAD_SILENCE_MS     = args.vad_silence_ms
+MAX_HISTORY_TURNS  = args.max_history_turns
+ECHO_SUPPRESS_MS   = args.echo_suppress_ms
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Startup checks
@@ -126,7 +131,10 @@ if _KOKORO_AVAILABLE:
     _tts = KokoroPipeline(lang_code="a")
     log.info("Kokoro ready.")
 else:
-    log.warning("Kokoro not installed — transcript-only mode (no audio output)")
+    log.warning("=" * 60)
+    log.warning("KOKORO NOT INSTALLED — NO AUDIO OUTPUT WILL BE SENT")
+    log.warning("Fix: pip install kokoro")
+    log.warning("=" * 60)
     _tts = None
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -134,17 +142,14 @@ else:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pcm16_to_float32(data: bytes) -> np.ndarray:
-    """Raw s16le bytes → float32 numpy array in [-1, 1]."""
     return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
 
 
 def float32_to_pcm16(audio: np.ndarray) -> bytes:
-    """float32 array → raw s16le bytes."""
     return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
 
 
 def resample_linear(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Simple linear resample — adequate quality for speech."""
     if orig_sr == target_sr:
         return audio
     n_out = int(len(audio) * target_sr / orig_sr)
@@ -156,7 +161,6 @@ def resample_linear(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarr
 
 
 def run_tts(text: str) -> bytes:
-    """Return s16le PCM from Kokoro, or empty bytes if unavailable."""
     if _tts is None:
         return b""
     try:
@@ -170,75 +174,69 @@ def run_tts(text: str) -> bytes:
         return b""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VAD accumulator — fixed to handle small incoming chunks correctly
+# VAD accumulator
 # ─────────────────────────────────────────────────────────────────────────────
 
 class VADAccumulator:
     """
-    Buffers incoming PCM (which arrives in small chunks — often 160 samples /
-    10 ms from the OpenAI Realtime protocol) and runs Silero VAD only once a
-    full 512-sample (32 ms) window is available.  Commits an utterance after
-    VAD_SILENCE_MS of trailing silence.
+    Buffers small incoming PCM chunks (often 160 samples / 10 ms from the
+    OpenAI Realtime protocol) and runs Silero VAD on full 512-sample windows.
+    Commits an utterance after VAD_SILENCE_MS of trailing silence.
     """
 
-    # Silero VAD hard requirement: exactly 512 samples at 16 kHz
-    CHUNK = 512
+    CHUNK = 512  # Silero hard requirement: 512 samples at 16 kHz
 
     def __init__(self, session_id: str) -> None:
         self._id = session_id
         self._speech_frames: list[np.ndarray] = []
         self._has_speech = False
         self._silence_since: float | None = None
-        # accumulates sub-512-sample chunks until we have a full window
         self._pending: np.ndarray = np.array([], dtype=np.float32)
 
     def push(self, pcm_bytes: bytes, src_sr: int = SAMPLE_RATE) -> np.ndarray | None:
-        """
-        Feed a raw PCM chunk.  Returns a committed utterance array (float32,
-        16 kHz) when end-of-speech is detected, otherwise None.
-        """
         audio = pcm16_to_float32(pcm_bytes)
         if src_sr != SAMPLE_RATE:
             audio = resample_linear(audio, src_sr, SAMPLE_RATE)
 
-        # append to pending buffer
         self._pending = np.concatenate([self._pending, audio])
 
         committed: np.ndarray | None = None
 
-        # drain full 512-sample chunks
         while len(self._pending) >= self.CHUNK:
             chunk = self._pending[: self.CHUNK]
-            self._pending = self._pending[self.CHUNK :]
+            self._pending = self._pending[self.CHUNK:]
 
             prob = _vad_model(torch.from_numpy(chunk), SAMPLE_RATE).item()
 
-            if args.debug and prob > 0.05:
+            if prob > 0.1:
                 log.debug("[%s][VAD] prob=%.3f has_speech=%s", self._id, prob, self._has_speech)
+            if prob > 0.3 and not self._has_speech:
+                log.info("[%s][VAD] near-threshold speech detected: prob=%.3f", self._id, prob)
 
             if prob >= VAD_THRESHOLD:
                 self._has_speech = True
                 self._silence_since = None
                 self._speech_frames.append(chunk)
-
             elif self._has_speech:
-                # still collecting — keep trailing silence in the buffer so
-                # the model hears the natural end of the utterance
                 self._speech_frames.append(chunk)
                 if self._silence_since is None:
                     self._silence_since = time.monotonic()
                 elapsed_ms = (time.monotonic() - self._silence_since) * 1000
                 if elapsed_ms >= VAD_SILENCE_MS:
                     committed = self._commit()
-                    break  # stop processing; the utterance is done
+                    break
 
         return committed
 
     def flush(self) -> np.ndarray | None:
-        """Force-commit whatever speech has been buffered (e.g. on client commit event)."""
-        if self._speech_frames:
-            return self._commit()
-        return None
+        return self._commit() if self._speech_frames else None
+
+    def reset(self) -> None:
+        """Discard all buffered audio — called during echo suppression window."""
+        self._speech_frames.clear()
+        self._pending = np.array([], dtype=np.float32)
+        self._has_speech = False
+        self._silence_since = None
 
     def _commit(self) -> np.ndarray:
         utt = np.concatenate(self._speech_frames)
@@ -259,38 +257,44 @@ class VADAccumulator:
 
 SYSTEM_PROMPT = (
     "You are Reachy Mini, a friendly desktop robot assistant. "
+    "Always respond in English, no matter what language the audio sounds like. "
     "You are listening to audio from a microphone that may also pick up "
     "your own voice played back from the speaker — ignore any audio that "
     "sounds like yourself and focus only on the human speaking to you. "
-    "If multiple humans are speaking, address each one naturally. "
-    "Keep responses concise and conversational."
+    "If the audio is unclear, ask one short clarifying question in English. "
+    "Keep responses concise and conversational — two sentences or fewer."
 )
 
 
 def infer(audio: np.ndarray, history: list[dict]) -> str:
-    """Run Gemma 4 12B on an audio utterance and return the response text."""
+    # audio: float32, 16 kHz, normalized to [-1, 1] — matches Gemma 4 spec exactly
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
     messages.append({
         "role": "user",
-        "content": [
-            {"type": "audio"},   # audio placeholder — must come before text
-            {"type": "text", "text": "Respond to what was just said."},
-        ],
+        "content": [{"type": "audio", "audio": audio}],
     })
 
-    prompt = _processor.apply_chat_template(
+    inputs = _processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
-        enable_thinking=False,  # keeps latency low for conversational use
-    )
-
-    inputs = _processor(
-        text=prompt,
-        audio=audio,
-        sampling_rate=SAMPLE_RATE,
+        tokenize=True,
         return_tensors="pt",
+        return_dict=True,
+        enable_thinking=False,
     ).to(DEVICE)
+
+    # Cast float tensors to match model dtype (bfloat16); int tensors stay as-is.
+    model_dtype = next(_model.parameters()).dtype
+    inputs = {
+        k: v.to(dtype=model_dtype) if v.is_floating_point() else v
+        for k, v in inputs.items()
+    }
+
+    input_len = inputs["input_ids"].shape[-1]
+    log.info("[infer] audio %.2fs → tokens: %d  features: %s",
+             len(audio) / SAMPLE_RATE, input_len,
+             tuple(inputs["input_features"].shape) if "input_features" in inputs else "none")
 
     with torch.inference_mode():
         out = _model.generate(
@@ -302,8 +306,7 @@ def infer(audio: np.ndarray, history: list[dict]) -> str:
             top_k=64,
         )
 
-    new_tokens = out[0][inputs["input_ids"].shape[-1]:]
-    return _processor.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    return _processor.decode(out[0][input_len:], skip_special_tokens=True).strip()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OpenAI Realtime protocol helpers
@@ -322,12 +325,18 @@ class Session:
         self.id = str(uuid.uuid4())[:8]
         self.vad = VADAccumulator(self.id)
         self.history: list[dict] = []
-        # will be updated from session.update — default to 24kHz (OpenAI spec)
         self.input_sr: int = 24_000
-        self._lock = asyncio.Lock()
+
+        # inference state
+        self._busy = False          # True while inference + TTS is running
+        self._pending_utt: np.ndarray | None = None  # most recent queued utt
+        self._suppress_until: float = 0.0  # epoch time before which VAD commits are ignored
 
     async def send(self, kind: str, **kw: Any) -> None:
         await self.ws.send_text(_evt(kind, **kw))
+
+    def _echo_suppressed(self) -> bool:
+        return time.monotonic() < self._suppress_until
 
     async def on_message(self, raw: str) -> None:
         try:
@@ -338,48 +347,43 @@ class Session:
 
         t = msg.get("type", "")
 
-        # ── session configuration ─────────────────────────────────────────
         if t == "session.update":
             cfg = msg.get("session", {})
             log.info("[%s] session.update: %s", self.id, json.dumps(cfg))
-
             fmt = cfg.get("input_audio_format", "pcm16")
             if fmt in ("g711_ulaw", "g711_alaw"):
                 self.input_sr = 8_000
             else:
-                # pcm16 in OpenAI Realtime is 24kHz by default; Reachy may
-                # send 16kHz — the resampler handles either correctly
                 self.input_sr = cfg.get("input_audio_sample_rate", 24_000)
-
             log.info("[%s] input format=%s sr=%d", self.id, fmt, self.input_sr)
 
-        # ── incoming audio ────────────────────────────────────────────────
         elif t == "input_audio_buffer.append":
             b64 = msg.get("audio", "")
             if not b64:
-                log.warning("[%s] empty audio payload", self.id)
                 return
 
             raw_bytes = base64.b64decode(b64)
-            log.debug("[%s] audio chunk: %d bytes (%.1f ms at %d Hz)",
-                      self.id, len(raw_bytes),
-                      len(raw_bytes) / 2 / self.input_sr * 1000,
-                      self.input_sr)
+            if not hasattr(self, "_first_audio_logged"):
+                self._first_audio_logged = True
+                log.info("[%s] first audio chunk received (%d bytes) — VAD active", self.id, len(raw_bytes))
+            log.debug("[%s] audio chunk: %d bytes", self.id, len(raw_bytes))
+
+            # during echo suppression, drain the VAD buffer without committing
+            if self._echo_suppressed():
+                self.vad.reset()
+                return
 
             utt = self.vad.push(raw_bytes, self.input_sr)
             if utt is not None:
-                asyncio.ensure_future(self._respond(utt))
+                await self._enqueue(utt)
 
-        # ── manual commit / explicit response trigger ─────────────────────
         elif t in ("input_audio_buffer.commit", "response.create"):
-            log.info("[%s] manual commit triggered by %s", self.id, t)
-            utt = self.vad.flush()
-            if utt is not None:
-                asyncio.ensure_future(self._respond(utt))
-            else:
-                log.info("[%s] flush: no buffered speech to commit", self.id)
+            log.info("[%s] manual commit: %s", self.id, t)
+            if not self._echo_suppressed():
+                utt = self.vad.flush()
+                if utt is not None:
+                    await self._enqueue(utt)
 
-        # ── text turn injection (rare) ────────────────────────────────────
         elif t == "conversation.item.create":
             item = msg.get("item", {})
             text = " ".join(
@@ -393,41 +397,71 @@ class Session:
                 log.info("[%s] injected %s turn: %s", self.id, role, text[:60])
 
         else:
-            log.debug("[%s] unhandled message type: %s", self.id, t)
+            log.debug("[%s] unhandled: %s", self.id, t)
+
+    async def _enqueue(self, utt: np.ndarray) -> None:
+        """
+        Drop-and-replace queuing: if inference is already running, store the
+        newest utterance and let the running task pick it up when done.
+        This prevents queue pile-up from echo pickup.
+        """
+        self._pending_utt = utt
+        if not self._busy:
+            self._busy = True
+            asyncio.ensure_future(self._respond_loop())
+
+    async def _respond_loop(self) -> None:
+        """
+        Drain pending utterances one at a time.  If a new one arrives while
+        we're generating, we process it immediately after — but we never queue
+        more than one deep, so echo bursts don't pile up.
+        """
+        while self._pending_utt is not None:
+            utt = self._pending_utt
+            self._pending_utt = None
+            await self._respond(utt)
+        self._busy = False
 
     async def _respond(self, audio: np.ndarray) -> None:
-        """Run inference and stream the response back. Serialized per session."""
-        async with self._lock:
-            await self.send("input_audio_buffer.speech_started")
-            await self.send("input_audio_buffer.speech_stopped")
-            await self.send("response.created")
+        await self.send("input_audio_buffer.speech_started")
+        await self.send("input_audio_buffer.speech_stopped")
+        await self.send("response.created")
 
-            t0 = time.monotonic()
-            loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(None, infer, audio, list(self.history))
-            log.info("[%s] inference %.1fs → %s", self.id, time.monotonic() - t0, text[:100])
+        t0 = time.monotonic()
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, infer, audio, list(self.history))
+        log.info("[%s] inference %.1fs → %s", self.id, time.monotonic() - t0, text[:100])
 
-            # update history (text only — audio blobs are not replayed)
-            self.history.append({"role": "assistant", "content": text})
-            if len(self.history) > MAX_HISTORY_TURNS:
-                self.history = self.history[-MAX_HISTORY_TURNS:]
-
-            # send transcript
-            await self.send("response.audio_transcript.delta", delta=text)
-            await self.send("response.audio_transcript.done", transcript=text)
-
-            # TTS → PCM → stream in chunks
-            pcm = await loop.run_in_executor(None, run_tts, text)
-            if pcm:
-                chunk_size = 4096  # ~128 ms at 16kHz s16le
-                for i in range(0, len(pcm), chunk_size):
-                    await self.send(
-                        "response.audio.delta",
-                        delta=base64.b64encode(pcm[i: i + chunk_size]).decode(),
-                    )
-
+        if not text:
             await self.send("response.audio.done")
             await self.send("response.done")
+            return
+
+        self.history.append({"role": "assistant", "content": text})
+        if len(self.history) > MAX_HISTORY_TURNS:
+            self.history = self.history[-MAX_HISTORY_TURNS:]
+
+        await self.send("response.audio_transcript.delta", delta=text)
+        await self.send("response.audio_transcript.done", transcript=text)
+
+        pcm = await loop.run_in_executor(None, run_tts, text)
+        if pcm:
+            # activate echo suppression before we start sending audio back
+            tts_duration_ms = len(pcm) / 2 / SAMPLE_RATE * 1000
+            suppress_ms = tts_duration_ms + ECHO_SUPPRESS_MS
+            self._suppress_until = time.monotonic() + suppress_ms / 1000
+            self.vad.reset()
+            log.info("[%s] echo suppression active for %.0f ms", self.id, suppress_ms)
+
+            chunk_size = 4096
+            for i in range(0, len(pcm), chunk_size):
+                await self.send(
+                    "response.audio.delta",
+                    delta=base64.b64encode(pcm[i: i + chunk_size]).decode(),
+                )
+
+        await self.send("response.audio.done")
+        await self.send("response.done")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FastAPI app
@@ -453,16 +487,17 @@ async def realtime(ws: WebSocket) -> None:
     session = Session(ws)
     log.info("Connected  → session %s", session.id)
 
-    # announce session
     await session.send(
         "session.created",
         session={
             "id": session.id,
+            "object": "realtime.session",
             "model": MODEL_ID,
             "modalities": ["text", "audio"],
             "input_audio_format": "pcm16",
+            "input_audio_sample_rate": 24000,
             "output_audio_format": "pcm16",
-            "input_audio_transcription": {"model": "gemma4-unified"},
+            "output_audio_sample_rate": 24000,
             "turn_detection": {"type": "server_vad"},
         },
     )
@@ -475,9 +510,6 @@ async def realtime(ws: WebSocket) -> None:
     except Exception as exc:
         log.exception("Session %s crashed: %s", session.id, exc)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entrypoint
-# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     log.info("Starting server  ws://%s:%d/v1/realtime", args.host, args.port)
