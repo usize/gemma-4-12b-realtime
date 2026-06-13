@@ -26,12 +26,15 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import io
 import json
 import logging
 import sys
 import time
 import uuid
 from typing import Any
+
+from PIL import Image
 
 import numpy as np
 import torch
@@ -286,14 +289,16 @@ SYSTEM_PROMPT = (
 )
 
 
-def infer(audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PROMPT) -> str:
+def infer(audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PROMPT,
+          image: "Image.Image | None" = None) -> str:
     # audio: float32, 16 kHz, normalized to [-1, 1] — matches Gemma 4 spec exactly
     messages: list[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
-    messages.append({
-        "role": "user",
-        "content": [{"type": "audio", "audio": audio}],
-    })
+    user_content: list[dict] = []
+    if image is not None:
+        user_content.append({"type": "image", "image": image})
+    user_content.append({"type": "audio", "audio": audio})
+    messages.append({"role": "user", "content": user_content})
 
     inputs = _processor.apply_chat_template(
         messages,
@@ -312,8 +317,10 @@ def infer(audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PR
     }
 
     input_len = inputs["input_ids"].shape[-1]
-    log.info("[infer] audio %.2fs → tokens: %d  features: %s",
-             len(audio) / SAMPLE_RATE, input_len,
+    log.info("[infer] audio %.2fs image=%s → tokens: %d  features: %s",
+             len(audio) / SAMPLE_RATE,
+             f"{image.width}x{image.height}" if image is not None else "none",
+             input_len,
              tuple(inputs["input_features"].shape) if "input_features" in inputs else "none")
 
     with torch.inference_mode():
@@ -352,6 +359,7 @@ class Session:
         self._busy = False          # True while inference + TTS is running
         self._pending_utt: np.ndarray | None = None  # most recent queued utt
         self._suppress_until: float = 0.0  # epoch time before which VAD commits are ignored
+        self.latest_image: Image.Image | None = None  # most recent frame from app camera tool
 
     async def send(self, kind: str, **kw: Any) -> None:
         await self.ws.send_text(_evt(kind, **kw))
@@ -426,9 +434,25 @@ class Session:
 
         elif t == "conversation.item.create":
             item = msg.get("item", {})
+            content = item.get("content", [])
+
+            # Extract image (data URI from camera tool)
+            for c in content:
+                if c.get("type") == "input_image":
+                    url = c.get("image_url", "")
+                    if url.startswith("data:"):
+                        try:
+                            _, b64 = url.split(",", 1)
+                            self.latest_image = Image.open(io.BytesIO(base64.b64decode(b64)))
+                            log.info("[%s] camera frame received (%dx%d)",
+                                     self.id, self.latest_image.width, self.latest_image.height)
+                        except Exception as exc:
+                            log.warning("[%s] failed to decode image: %s", self.id, exc)
+
+            # Extract text turns (function_call_output etc.)
             text = " ".join(
                 c.get("text", "")
-                for c in item.get("content", [])
+                for c in content
                 if c.get("type") == "text"
             )
             if text:
@@ -469,7 +493,9 @@ class Session:
 
         t0 = time.monotonic()
         loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(None, infer, audio, list(self.history), self.system_prompt)
+        image = self.latest_image
+        self.latest_image = None  # consume; next response won't reuse a stale frame
+        text = await loop.run_in_executor(None, infer, audio, list(self.history), self.system_prompt, image)
         log.info("[%s] inference %.1fs → %s", self.id, time.monotonic() - t0, text[:100])
 
         if not text:
