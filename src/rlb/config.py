@@ -129,9 +129,13 @@ class CognitionConfig(BaseModel):
     memory_db: str = "data/memory.sqlite"
     max_tool_iters_per_turn: int = 6
     wake_mode: str = "always"  # always | wakeword | look_to_talk
-    # Ambient heartbeat: when no one is talking, glance at the camera every this-many
-    # seconds and react only if something warrants it (see Orchestrator._tick).
-    heartbeat_s: float = 3.0
+    # Ambient heartbeat: when no one is talking, glance at the camera periodically
+    # and react only if something warrants it (see Orchestrator._tick).
+    # Fast phase: every N seconds for M seconds after last user utterance.
+    # Idle phase: every N seconds when no user input for M+ seconds.
+    heartbeat_fast_s: float = 1.0
+    heartbeat_fast_duration_s: float = 5.0
+    heartbeat_idle_s: float = 15.0
     # Cheap pre-filter: only spend an LLM call on a glance when the scene actually changed
     # (ego-motion-compensated frame diff). Threshold is mean abs pixel change in [0,1].
     heartbeat_diff: bool = True

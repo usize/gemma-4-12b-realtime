@@ -14,6 +14,7 @@ for an LLM than metres/radians); we convert at the boundary.
 
 from __future__ import annotations
 
+import datetime
 import math
 from dataclasses import dataclass
 
@@ -66,14 +67,16 @@ class RobotState:
     roll: float; pitch: float; yaw: float  # deg
     antenna_left: float; antenna_right: float  # deg, relative to neutral
     body_yaw: float | None = None          # deg
+    time_str: str = ""                     # human-readable current time
 
     def line(self) -> str:
         """One compact line for prompt injection (kept tiny + stable in shape)."""
         b = "" if self.body_yaw is None else f" body_yaw={self.body_yaw:+.0f}"
+        t = f" now={self.time_str}" if self.time_str else ""
         return (
             f"head xyz_cm=({self.x:+.1f},{self.y:+.1f},{self.z:+.1f}) "
             f"rpy_deg=({self.roll:+.0f},{self.pitch:+.0f},{self.yaw:+.0f}){b} "
-            f"antennas_deg=(L{self.antenna_left:+.0f},R{self.antenna_right:+.0f})"
+            f"antennas_deg=(L{self.antenna_left:+.0f},R{self.antenna_right:+.0f}){t}"
         )
 
 
@@ -98,6 +101,7 @@ def read_state(mini) -> RobotState:
         x=tx * 100, y=ty * 100, z=tz * 100,
         roll=roll, pitch=pitch, yaw=yaw,
         antenna_left=al, antenna_right=ar,
+        time_str=datetime.datetime.now().strftime("%H:%M:%S %Z"),
     )
 
 

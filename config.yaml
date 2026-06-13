@@ -5,7 +5,7 @@
 inference:
   # OpenAI-compatible endpoint. Works with llama.cpp server, LM Studio, vLLM, or MLX.
   # Location is a config value, not an architectural decision (plan §0.3).
-  base_url: "http://localhost:8081/v1"   # llama.cpp VL server (Qwen3.6-27B, vision-capable)
+  base_url: "http://localhost:8082/v1"   # llama.cpp VL server (Qwen3.6-27B, vision-capable)
   api_key: "not-needed-for-local"
   model: "Qwen3.6-27B-Q4_K_S.gguf"
   request_timeout_s: 120.0
@@ -83,6 +83,12 @@ cognition:
   memory_db: "data/memory.sqlite"
   max_tool_iters_per_turn: 6
   wake_mode: "always"         # always | wakeword | look_to_talk (plan §2.4)
+  # Dynamic heartbeat: fast checks after user input, slow when idle
+  heartbeat_fast_s: 1.0           # check every Ns after last user utterance
+  heartbeat_fast_duration_s: 5.0  # fast phase lasts for Ns
+  heartbeat_idle_s: 3.0          # check every Ns when idle
+  heartbeat_diff: true            # scene-diff pre-filter
+  heartbeat_motion_threshold: 0.001
 
 tools:
   ring2_enabled: false        # coding harness off until Phase 4

@@ -182,6 +182,7 @@ def chat(
     down = []
     for name, url in checks.items():
         try:
+            console.print(f"checking health: {name}, {url}")
             if httpx.get(url, timeout=2.0).status_code != 200:
                 down.append(name)
         except httpx.HTTPError:
@@ -229,7 +230,6 @@ def say(
         tts.speak(text, instruct=instruct or None)
         tts.close()
     console.print("[green]✓ spoke (robot speaker)[/]")
-
 
 @app.command()
 def embody(

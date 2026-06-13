@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import json
 import logging
 import threading
@@ -29,6 +30,7 @@ import numpy as np
 from rlb.audio.stream import MicStream, SileroSegmenter
 from rlb.cognition.prompt import (
     AMBIENT_DIRECTIVE,
+    IDLE_REPLY,
     SYSTEM_PROMPT,
     assemble_messages,
     clean_reply,
@@ -55,7 +57,10 @@ def activity_tool() -> dict:
                 "Start or stop an ongoing activity you run on your own — a game like Simon "
                 "Says, watching for something, following a moving object, etc. Pass a short "
                 "goal to START (then you'll get a turn every few seconds to look and act "
-                "without being spoken to); pass an empty goal to STOP when it's over."),
+                "without being spoken to). IMPORTANT: When you give a command or say something "
+                "the user should do, always follow up on your next heartbeat tick to check if "
+                "they complied (you'll see comparison snapshots). Pass an empty goal to STOP "
+                "when it's over."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -100,9 +105,14 @@ class Orchestrator:
         )
         self.history: list[dict] = []
         self._speaking = threading.Event()
+        # Snapshot ring: keep last 3 timestamped image snapshots for context.
+        self._snapshots: list[tuple[str, bytes]] = []
+        self._MAX_SNAPSHOTS = 3
+        self._context_token_est: int = 0
         # Heartbeat: an activity the model sets to keep acting on its own (see _tick).
         self._activity: str | None = None
         self._last_cognition = time.monotonic()
+        self._last_user_input = time.monotonic()  # tracks last user utterance for dynamic heartbeat
         # Cheap pre-filter so an empty/static scene costs nothing (ego-motion compensated).
         self._watcher = (
             FrameWatcher(cfg.motion.camera_hfov_deg, cfg.motion.camera_vfov_deg,
@@ -111,7 +121,8 @@ class Orchestrator:
         )
 
     # ---- one cognition turn -------------------------------------------------
-    async def _respond(self, user_text: str, image_jpeg: bytes | None = None) -> str:
+    async def _respond(self, user_text: str, image_jpeg: bytes | None = None,
+                       is_heartbeat: bool = False) -> str:
         """Agentic turn: the model may call movement/activity skills, then speaks.
 
         Movement tool calls execute immediately (routed through the controller) and we
@@ -128,8 +139,20 @@ class Orchestrator:
         st.pitch = self.motion.head_pitch_deg
         state = st.line()
         parts = [text_part(user_text)]
+
+        # Inject snapshot references for heartbeat ticks so the model can compare
+        # "did the user comply since the last command?" against reference images.
+        if is_heartbeat and self._snapshots:
+            snap_refs = []
+            for ts, snap_jpeg in self._snapshots:
+                snap_refs.append(text_part(f"[snapshot @ {ts}]:"))
+                snap_refs.append(image_part(snap_jpeg))
+            parts = snap_refs + parts
+
         if image_jpeg:
-            parts.append(image_part(image_jpeg))  # so it actually sees, not confabulates
+            parts.append(text_part("[current image]:"))
+            parts.append(image_part(image_jpeg))
+
         system = system_with_activity(self._activity) if self._activity else SYSTEM_PROMPT
         messages = assemble_messages(self.history, parts, state_line=state, system=system)
         tools = skills_schema() + [search_tool(), activity_tool()]
@@ -173,11 +196,46 @@ class Orchestrator:
             return f"activity set: {goal}" if goal else "activity cleared"
         return self.skills.execute(tc.name, tc.arguments)
 
-    def _remember(self, user_text: str, reply: str) -> None:
+    def _remember(self, user_text: str, reply: str, image_jpeg: bytes | None = None) -> None:
         self.history.append({"role": "user", "content": user_text})
         self.history.append({"role": "assistant", "content": reply})
+
+        # Estimate tokens: ~1 per 4 chars for text, ~500 per image
+        self._context_token_est += len(user_text) // 4 + len(reply) // 4
+        if image_jpeg:
+            self._context_token_est += 500
+
+        # Save snapshot on each user turn (ring buffer of last N).
+        if image_jpeg:
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            self._snapshots.append((ts, image_jpeg))
+            if len(self._snapshots) > self._MAX_SNAPSHOTS:
+                self._snapshots.pop(0)
+
         if len(self.history) > 20:
             self.history = self.history[-20:]
+
+    def _compact_if_needed(self) -> None:
+        """Summarize history and free snapshots when context > 64k tokens."""
+        if self._context_token_est < 64_000 or len(self.history) < 6:
+            return
+        recent = self.history[-4:]
+        old = self.history[:-4]
+        summary_parts = []
+        in_user = False
+        for msg in old:
+            if msg["role"] == "user":
+                summary_parts.append(f"You: {msg['content']}")
+                in_user = True
+            elif msg["role"] == "assistant" and in_user:
+                summary_parts.append(f"Reachy: {msg['content']}")
+                in_user = False
+        summary_text = " ".join(summary_parts)
+        self.history = [{"role": "system",
+                         "content": f"(Earlier conversation summary: {summary_text})"}] + recent
+        self._context_token_est = sum(len(m["content"]) // 4 for m in self.history)
+        if len(self._snapshots) > 1:
+            self._snapshots = [self._snapshots[-1]]
 
     def _speak(self, text: str) -> bool:
         """Speak in interruptible chunks; return True if the user barged in.
@@ -249,10 +307,10 @@ class Orchestrator:
                     for utt in self.segmenter.push(frame):
                         self._handle_utterance(utt)
                 # Ambient heartbeat: whenever no one is talking, glance at the camera every
-                # cfg.cognition.heartbeat_s and react only if something needs it.
+                # _heartbeat_interval_s() and react only if something needs it.
                 if (not self._speaking.is_set()
                         and not self.segmenter.in_speech
-                        and time.monotonic() - self._last_cognition >= self.cfg.cognition.heartbeat_s):
+                        and time.monotonic() - self._last_cognition >= self._heartbeat_interval_s()):
                     self._tick()
         finally:
             stop_event.set()
@@ -260,6 +318,13 @@ class Orchestrator:
             self.tts.close()
             self.asr.close()
             motion_thread.join(timeout=2.0)
+
+    def _heartbeat_interval_s(self) -> float:
+        """Return dynamic heartbeat interval based on time since last user input."""
+        elapsed = time.monotonic() - self._last_user_input
+        if elapsed < self.cfg.cognition.heartbeat_fast_duration_s:
+            return self.cfg.cognition.heartbeat_fast_s
+        return self.cfg.cognition.heartbeat_idle_s
 
     def _handle_utterance(self, utt: np.ndarray) -> None:
         peak = float(np.abs(utt).max())
@@ -272,23 +337,30 @@ class Orchestrator:
         log.info("you: %s", user_text)
         print(f"\n🧑 {user_text}")
         jpeg = frame_jpeg(self.session.mini, max_px=self.cfg.inference.max_image_px)
+        self._compact_if_needed()
         reply = asyncio.run(self._respond(user_text, image_jpeg=jpeg))
-        self._remember(user_text, reply)
+        self._remember(user_text, reply, image_jpeg=jpeg)
         self._last_cognition = time.monotonic()
+        self._last_user_input = time.monotonic()
         print(f"🤖 {reply}")
         self._speak(reply)
 
     def _tick(self) -> None:
         """Ambient heartbeat: glance at the camera and react only if something warrants it.
 
-        Runs whenever no one is talking (every cfg.cognition.heartbeat_s), in the main loop
+        Runs on a dynamic interval (fast after user input, slow when idle), in the main loop
         thread so cognition stays serialized with spoken turns. A '(wait)' / empty reply
         means 'nothing to react to' and is neither spoken nor remembered, so history stays
         to real exchanges and the robot doesn't chatter.
+
+        When an activity is active, the scene-diff filter is bypassed so the model can
+        check pending tasks even on a static frame. Recent image snapshots are injected
+        into the prompt as references for comparison.
         """
         frame = self.session.mini.media.get_frame()
-        # Cheap pre-filter: skip the LLM unless the scene changed (cancelling head motion).
-        if self._watcher is not None:
+        # BYPASS scene-diff filter when an activity is active — need to check tasks
+        skip_diff = self._activity is not None
+        if not skip_diff and self._watcher is not None:
             changed, diff = self._watcher.changed(
                 frame, self.motion.camera_yaw_deg, self.motion.camera_pitch_deg)
             if not changed:
@@ -299,7 +371,9 @@ class Orchestrator:
         if jpeg is None:                       # dark/blocked frame — nothing to evaluate
             self._last_cognition = time.monotonic()
             return
-        reply = asyncio.run(self._respond(AMBIENT_DIRECTIVE, image_jpeg=jpeg))
+
+        self._compact_if_needed()
+        reply = asyncio.run(self._respond(AMBIENT_DIRECTIVE, image_jpeg=jpeg, is_heartbeat=True))
         if not is_idle_reply(reply):
             self._remember("(noticed something)", reply)
             print(f"🤖 {reply}")

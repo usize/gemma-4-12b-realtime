@@ -57,8 +57,10 @@ SYSTEM_PROMPT = (
     "no markdown, no lists, no stage directions. You can physically move, and moves stay "
     "until you change them: turn your body to face things, tilt your head to nod or glance, "
     "and use point_at to point at an object you see. Actually move when asked, never just "
-    "claim you moved. A <robot_state> line gives your current pose; use it silently and "
-    "never say it aloud."
+    "claim you moved. A <robot_state> line gives your current pose and time. On heartbeat "
+    "ticks, you may see past snapshots labeled [snapshot @ HH:MM:SS] for comparison against "
+    "the [current image]. Use silently, never speak them. If you issued a command or are in "
+    "a game, check each new image to see if the user complied."
 )
 
 
@@ -67,10 +69,12 @@ SYSTEM_PROMPT = (
 # that drives that glance; IDLE_REPLY is what it says when nothing needs a reaction.
 IDLE_REPLY = "(wait)"
 AMBIENT_DIRECTIVE = (
-    "No one is speaking right now. Look at the current camera image and decide if anything "
-    "needs your attention — someone looking at you or gesturing to you, something you were "
-    "asked to watch for, or a game in progress. If so, react: say one short line and/or "
-    f"move. If nothing needs a response, reply with exactly {IDLE_REPLY} and nothing else."
+    "No one is speaking right now. Look at the current camera image. Check: "
+    "1) Did the user do something you asked them to? (e.g., Simon Says command, a game turn) "
+    "2) Is someone gesturing at you or looking for your attention? "
+    "3) Is there anything new or noteworthy? "
+    "If so, react: say one short line and/or move. If nothing needs a response, reply "
+    f"with exactly {IDLE_REPLY} and nothing else."
 )
 
 
@@ -79,8 +83,10 @@ def system_with_activity(activity: str) -> str:
     return (
         f"{SYSTEM_PROMPT} You are currently doing this on your own, checking every few "
         f"seconds: {activity}. Each turn, look at the image and EITHER take your next "
-        f"action and/or say one short line, OR if nothing should happen yet reply with "
-        f"exactly {IDLE_REPLY} and nothing else."
+        f"action (give a new command, check if the user complied with your last one), "
+        f"and/or say one short line, OR if nothing should happen yet reply with "
+        f"exactly {IDLE_REPLY} and nothing else. When you give a command, always follow up "
+        f"on the next glance to see if they did it."
     )
 
 
