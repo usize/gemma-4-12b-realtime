@@ -1,4 +1,5 @@
 .venv/
+.venv-3.12/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -7,6 +8,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+reachy_mini_conversation_app/
 
 # Local config — never commit secrets
 .env

@@ -77,6 +77,8 @@ parser.add_argument("--max-audio-secs",    type=int,   default=28)
 # Tune this to match your robot's speaker-to-mic delay + TTS duration estimate.
 parser.add_argument("--echo-suppress-ms",  type=int,   default=300,
                     help="Suppress VAD for this many ms after sending audio response")
+parser.add_argument("--tts-pitch-factor",  type=float, default=1,
+                    help="Multiply TTS pitch by this factor without changing speed (1.0=off, 1.35≈160 Hz from ~120 Hz base)")
 parser.add_argument("--debug", action="store_true",
                     help="Enable debug logging (shows per-chunk VAD probabilities)")
 args = parser.parse_args()
@@ -97,14 +99,16 @@ log = logging.getLogger("gemma-realtime")
 MODEL_ID           = args.model
 DEVICE             = args.device
 SAMPLE_RATE        = 16_000   # VAD + model input rate
-TTS_SAMPLE_RATE    = 24_000   # Kokoro native output rate (sent to client)
+KOKORO_SR          = 24_000   # Kokoro native generation rate
+TTS_SAMPLE_RATE    = 16_000   # Playback rate (app output_sample_rate=16000; must match)
 MIC_GAIN           = 8.0      # ReSpeaker peaks ~0.04; bring to normal levels
 MAX_AUDIO_SECS     = args.max_audio_secs
-MAX_NEW_TOKENS     = 128
+MAX_NEW_TOKENS     = 512
 VAD_THRESHOLD      = args.vad_threshold
 VAD_SILENCE_MS     = args.vad_silence_ms
 MAX_HISTORY_TURNS  = args.max_history_turns
 ECHO_SUPPRESS_MS   = args.echo_suppress_ms
+TTS_PITCH_FACTOR   = args.tts_pitch_factor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Startup checks
@@ -166,6 +170,24 @@ def resample_linear(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarr
     ).astype(np.float32)
 
 
+def _pitch_shift(audio: np.ndarray, factor: float) -> np.ndarray:
+    """Shift pitch by `factor` via single-pass resample.
+
+    factor > 1 → higher pitch and proportionally shorter duration.
+    factor < 1 → lower pitch and longer duration.
+    Duration change is small for modest factors (e.g. 1.2× → 17% shorter) and
+    inaudible in conversational speech.
+    """
+    if abs(factor - 1.0) < 0.01:
+        return audio
+    n_out = max(1, int(round(len(audio) / factor)))
+    return np.interp(
+        np.linspace(0, len(audio) - 1, n_out),
+        np.arange(len(audio)),
+        audio,
+    ).astype(np.float32)
+
+
 def _trim_silence(audio: np.ndarray, threshold: float = 0.02, pad_ms: int = 80,
                    sr: int = TTS_SAMPLE_RATE) -> np.ndarray:
     """Remove leading/trailing silence; keep a short pad so the end doesn't clip."""
@@ -183,13 +205,16 @@ def run_tts(text: str) -> bytes:
         return b""
     try:
         chunks = [
-            a for _, _, a in _tts(text, voice="af_heart", speed=1.3)
+            a for _, _, a in _tts(text, voice="af_heart", speed=1.0)
             if a is not None
         ]
         if not chunks:
             return b""
-        audio = _trim_silence(np.concatenate(chunks))
-        log.info("TTS: %.2fs of audio after silence trim", len(audio) / TTS_SAMPLE_RATE)
+        audio = _trim_silence(np.concatenate(chunks), sr=KOKORO_SR)
+        audio = resample_linear(audio, KOKORO_SR, TTS_SAMPLE_RATE)  # 24→16 kHz
+        audio = _pitch_shift(audio, TTS_PITCH_FACTOR)
+        log.info("TTS: %.2fs of audio at %d Hz (pitch×%.2f)",
+                 len(audio) / TTS_SAMPLE_RATE, TTS_SAMPLE_RATE, TTS_PITCH_FACTOR)
         return float32_to_pcm16(audio)
     except Exception as exc:
         log.warning("TTS error: %s", exc)
@@ -278,15 +303,7 @@ class VADAccumulator:
 # LLM inference
 # ─────────────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = (
-    "You are Reachy Mini, a friendly desktop robot assistant. "
-    "Always respond in English, no matter what language the audio sounds like. "
-    "You are listening to audio from a microphone that may also pick up "
-    "your own voice played back from the speaker — ignore any audio that "
-    "sounds like yourself and focus only on the human speaking to you. "
-    "If the audio is unclear, ask one short clarifying question in English. "
-    "Keep responses concise and conversational — two sentences or fewer."
-)
+SYSTEM_PROMPT = ""
 
 
 def infer(audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PROMPT,
@@ -360,9 +377,29 @@ class Session:
         self._pending_utt: np.ndarray | None = None  # most recent queued utt
         self._suppress_until: float = 0.0  # epoch time before which VAD commits are ignored
         self.latest_image: Image.Image | None = None  # most recent frame from app camera tool
+        self._camera_ready: asyncio.Event = asyncio.Event()
 
     async def send(self, kind: str, **kw: Any) -> None:
         await self.ws.send_text(_evt(kind, **kw))
+
+    async def _request_camera_frame(self, timeout: float = 0.7) -> None:
+        """Ask the app to capture a frame via the camera tool and wait for it."""
+        self._camera_ready.clear()
+        cam_id = uuid.uuid4().hex[:8]
+        await self.send(
+            "response.function_call_arguments.done",
+            name="camera",
+            call_id=f"cam-{cam_id}",
+            item_id=f"item-cam-{cam_id}",
+            response_id=f"resp-cam-{cam_id}",
+            output_index=0,
+            arguments='{"question": "What do you see right now?"}',
+        )
+        try:
+            await asyncio.wait_for(self._camera_ready.wait(), timeout=timeout)
+            log.info("[%s] camera frame ready", self.id)
+        except asyncio.TimeoutError:
+            log.info("[%s] camera probe timed out (%.1fs) — proceeding without frame", self.id, timeout)
 
     def _echo_suppressed(self) -> bool:
         return time.monotonic() < self._suppress_until
@@ -448,6 +485,8 @@ class Session:
                                      self.id, self.latest_image.width, self.latest_image.height)
                         except Exception as exc:
                             log.warning("[%s] failed to decode image: %s", self.id, exc)
+                        else:
+                            self._camera_ready.set()
 
             # Extract text turns (function_call_output etc.)
             text = " ".join(
@@ -491,11 +530,13 @@ class Session:
         await self.send("input_audio_buffer.speech_stopped")
         await self.send("response.created")
 
+        await self._request_camera_frame()
+
         t0 = time.monotonic()
         loop = asyncio.get_event_loop()
-        image = self.latest_image
-        self.latest_image = None  # consume; next response won't reuse a stale frame
-        text = await loop.run_in_executor(None, infer, audio, list(self.history), self.system_prompt, image)
+        text = await loop.run_in_executor(
+            None, infer, audio, list(self.history), self.system_prompt, self.latest_image
+        )
         log.info("[%s] inference %.1fs → %s", self.id, time.monotonic() - t0, text[:100])
 
         if not text:
@@ -564,7 +605,7 @@ async def realtime(ws: WebSocket) -> None:
             "input_audio_format": "pcm16",
             "input_audio_sample_rate": 16000,
             "output_audio_format": "pcm16",
-            "output_audio_sample_rate": 24000,
+            "output_audio_sample_rate": 16000,
             "turn_detection": {"type": "server_vad"},
         },
     )
