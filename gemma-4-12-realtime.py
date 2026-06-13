@@ -72,7 +72,7 @@ parser.add_argument("--vad-silence-ms",    type=int,   default=700)
 parser.add_argument("--max-audio-secs",    type=int,   default=28)
 # How long after sending audio output to suppress VAD (avoid mic echo pickup).
 # Tune this to match your robot's speaker-to-mic delay + TTS duration estimate.
-parser.add_argument("--echo-suppress-ms",  type=int,   default=800,
+parser.add_argument("--echo-suppress-ms",  type=int,   default=300,
                     help="Suppress VAD for this many ms after sending audio response")
 parser.add_argument("--debug", action="store_true",
                     help="Enable debug logging (shows per-chunk VAD probabilities)")
@@ -93,9 +93,11 @@ log = logging.getLogger("gemma-realtime")
 # ─────────────────────────────────────────────────────────────────────────────
 MODEL_ID           = args.model
 DEVICE             = args.device
-SAMPLE_RATE        = 16_000
+SAMPLE_RATE        = 16_000   # VAD + model input rate
+TTS_SAMPLE_RATE    = 24_000   # Kokoro native output rate (sent to client)
+MIC_GAIN           = 8.0      # ReSpeaker peaks ~0.04; bring to normal levels
 MAX_AUDIO_SECS     = args.max_audio_secs
-MAX_NEW_TOKENS     = 512
+MAX_NEW_TOKENS     = 128
 VAD_THRESHOLD      = args.vad_threshold
 VAD_SILENCE_MS     = args.vad_silence_ms
 MAX_HISTORY_TURNS  = args.max_history_turns
@@ -129,7 +131,8 @@ log.info("Model ready in %.1f s", time.monotonic() - _t0)
 if _KOKORO_AVAILABLE:
     log.info("Loading Kokoro TTS …")
     _tts = KokoroPipeline(lang_code="a")
-    log.info("Kokoro ready.")
+    _kokoro_sr = getattr(_tts, "sample_rate", None) or getattr(_tts, "sr", None) or TTS_SAMPLE_RATE
+    log.info("Kokoro ready (sample_rate=%d, TTS_SAMPLE_RATE=%d).", _kokoro_sr, TTS_SAMPLE_RATE)
 else:
     log.warning("=" * 60)
     log.warning("KOKORO NOT INSTALLED — NO AUDIO OUTPUT WILL BE SENT")
@@ -160,15 +163,31 @@ def resample_linear(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarr
     ).astype(np.float32)
 
 
+def _trim_silence(audio: np.ndarray, threshold: float = 0.02, pad_ms: int = 80,
+                   sr: int = TTS_SAMPLE_RATE) -> np.ndarray:
+    """Remove leading/trailing silence; keep a short pad so the end doesn't clip."""
+    mask = np.abs(audio) > threshold
+    if not mask.any():
+        return audio
+    first = int(np.argmax(mask))
+    last = int(len(mask) - np.argmax(mask[::-1]))
+    pad = int(pad_ms * sr / 1000)
+    return audio[max(0, first):min(len(audio), last + pad)]
+
+
 def run_tts(text: str) -> bytes:
     if _tts is None:
         return b""
     try:
         chunks = [
-            a for _, _, a in _tts(text, voice="af_heart", speed=1.0)
+            a for _, _, a in _tts(text, voice="af_heart", speed=1.3)
             if a is not None
         ]
-        return float32_to_pcm16(np.concatenate(chunks)) if chunks else b""
+        if not chunks:
+            return b""
+        audio = _trim_silence(np.concatenate(chunks))
+        log.info("TTS: %.2fs of audio after silence trim", len(audio) / TTS_SAMPLE_RATE)
+        return float32_to_pcm16(audio)
     except Exception as exc:
         log.warning("TTS error: %s", exc)
         return b""
@@ -197,6 +216,7 @@ class VADAccumulator:
         audio = pcm16_to_float32(pcm_bytes)
         if src_sr != SAMPLE_RATE:
             audio = resample_linear(audio, src_sr, SAMPLE_RATE)
+        audio = np.clip(audio * MIC_GAIN, -1.0, 1.0)
 
         self._pending = np.concatenate([self._pending, audio])
 
@@ -266,9 +286,9 @@ SYSTEM_PROMPT = (
 )
 
 
-def infer(audio: np.ndarray, history: list[dict]) -> str:
+def infer(audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PROMPT) -> str:
     # audio: float32, 16 kHz, normalized to [-1, 1] — matches Gemma 4 spec exactly
-    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
     messages.append({
         "role": "user",
@@ -326,6 +346,7 @@ class Session:
         self.vad = VADAccumulator(self.id)
         self.history: list[dict] = []
         self.input_sr: int = 24_000
+        self.system_prompt: str = SYSTEM_PROMPT
 
         # inference state
         self._busy = False          # True while inference + TTS is running
@@ -349,12 +370,31 @@ class Session:
 
         if t == "session.update":
             cfg = msg.get("session", {})
-            log.info("[%s] session.update: %s", self.id, json.dumps(cfg))
-            fmt = cfg.get("input_audio_format", "pcm16")
+            log.debug("[%s] session.update keys: %s", self.id, list(cfg.keys()))
+            instructions = cfg.get("instructions", "").strip()
+            if instructions:
+                self.system_prompt = instructions
+                log.info("[%s] using app system prompt (%d chars)", self.id, len(instructions))
+
+            # Support both OpenAI flat style and HF nested style:
+            #   Flat: session.input_audio_format / session.input_audio_sample_rate
+            #   HF:   session.audio.input.format = {"type": "audio/pcm", "rate": null|N}
+            audio_in_fmt = ((cfg.get("audio") or {}).get("input") or {}).get("format") or {}
+            fmt = cfg.get("input_audio_format") or (audio_in_fmt.get("type") if isinstance(audio_in_fmt, dict) else None) or "pcm16"
+
+            _MISSING = object()
             if fmt in ("g711_ulaw", "g711_alaw"):
                 self.input_sr = 8_000
             else:
-                self.input_sr = cfg.get("input_audio_sample_rate", 24_000)
+                old_sr = cfg.get("input_audio_sample_rate")
+                new_rate = audio_in_fmt.get("rate", _MISSING) if isinstance(audio_in_fmt, dict) else _MISSING
+                if old_sr is not None:
+                    self.input_sr = int(old_sr)
+                elif isinstance(new_rate, (int, float)):
+                    self.input_sr = int(new_rate)
+                else:
+                    # Explicit null (HF native) or absent → match our VAD/model rate
+                    self.input_sr = SAMPLE_RATE  # 16000
             log.info("[%s] input format=%s sr=%d", self.id, fmt, self.input_sr)
 
         elif t == "input_audio_buffer.append":
@@ -429,7 +469,7 @@ class Session:
 
         t0 = time.monotonic()
         loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(None, infer, audio, list(self.history))
+        text = await loop.run_in_executor(None, infer, audio, list(self.history), self.system_prompt)
         log.info("[%s] inference %.1fs → %s", self.id, time.monotonic() - t0, text[:100])
 
         if not text:
@@ -441,26 +481,27 @@ class Session:
         if len(self.history) > MAX_HISTORY_TURNS:
             self.history = self.history[-MAX_HISTORY_TURNS:]
 
-        await self.send("response.audio_transcript.delta", delta=text)
-        await self.send("response.audio_transcript.done", transcript=text)
+        await self.send("response.output_audio_transcript.delta", delta=text)
+        await self.send("response.output_audio_transcript.done", transcript=text)
 
         pcm = await loop.run_in_executor(None, run_tts, text)
         if pcm:
             # activate echo suppression before we start sending audio back
-            tts_duration_ms = len(pcm) / 2 / SAMPLE_RATE * 1000
+            tts_duration_ms = len(pcm) / 2 / TTS_SAMPLE_RATE * 1000
             suppress_ms = tts_duration_ms + ECHO_SUPPRESS_MS
             self._suppress_until = time.monotonic() + suppress_ms / 1000
             self.vad.reset()
-            log.info("[%s] echo suppression active for %.0f ms", self.id, suppress_ms)
+            log.info("[%s] TTS %.0f ms of audio, echo suppression %.0f ms",
+                     self.id, tts_duration_ms, suppress_ms)
 
             chunk_size = 4096
             for i in range(0, len(pcm), chunk_size):
                 await self.send(
-                    "response.audio.delta",
+                    "response.output_audio.delta",
                     delta=base64.b64encode(pcm[i: i + chunk_size]).decode(),
                 )
 
-        await self.send("response.audio.done")
+        await self.send("response.output_audio.done")
         await self.send("response.done")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -495,7 +536,7 @@ async def realtime(ws: WebSocket) -> None:
             "model": MODEL_ID,
             "modalities": ["text", "audio"],
             "input_audio_format": "pcm16",
-            "input_audio_sample_rate": 24000,
+            "input_audio_sample_rate": 16000,
             "output_audio_format": "pcm16",
             "output_audio_sample_rate": 24000,
             "turn_detection": {"type": "server_vad"},
