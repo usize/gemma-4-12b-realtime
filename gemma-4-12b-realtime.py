@@ -39,7 +39,7 @@ from PIL import Image
 import numpy as np
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from transformers import AutoProcessor, Gemma4UnifiedForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForCausalLM
 import uvicorn
 
 # ── Optional TTS ──────────────────────────────────────────────────────────────
@@ -128,7 +128,7 @@ log.info("=" * 60)
 
 _t0 = time.monotonic()
 _processor = AutoProcessor.from_pretrained(MODEL_ID)
-_model = Gemma4UnifiedForConditionalGeneration.from_pretrained(
+_model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.bfloat16,
     device_map=DEVICE,
