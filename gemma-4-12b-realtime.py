@@ -29,6 +29,7 @@ import base64
 import io
 import json
 import logging
+import re
 import sys
 import time
 import uuid
@@ -305,17 +306,90 @@ class VADAccumulator:
 
 SYSTEM_PROMPT = ""
 
+# ── Tool calling ────────────────────────────────────────────────────────────
+# Gemma-4-12B-it's chat template has native, verified support for OpenAI
+# Chat-Completions-style tool calling: a top-level `tools=` kwarg to
+# apply_chat_template, assistant messages with a `tool_calls` field, and
+# `{"role": "tool", "tool_call_id": ..., "content": ...}` result messages.
+# Verified directly against the cached tokenizer's chat_template (see the
+# PR description for the exact rendering) — NOT a guess.
+#
+# When the model wants to call a tool it emits a `<|tool_call>` ... `<tool_call|>`
+# span. Both are real added tokens (confirmed via get_added_vocab()) and are
+# silently stripped by decode(skip_special_tokens=True), so detecting them
+# requires scanning the raw generated token ids *before* decoding — decoding
+# the whole thing first and string-searching for the marker would never work.
+_tokenizer = getattr(_processor, "tokenizer", _processor)
+_TOOL_CALL_START_ID = _tokenizer.convert_tokens_to_ids("<|tool_call>")
+_TOOL_CALL_END_ID = _tokenizer.convert_tokens_to_ids("<tool_call|>")
+_TOOL_CALL_TOKENS_RESOLVED = isinstance(_TOOL_CALL_START_ID, int) and isinstance(_TOOL_CALL_END_ID, int)
+if not _TOOL_CALL_TOKENS_RESOLVED:
+    log.warning(
+        "Could not resolve <|tool_call>/<tool_call|> token ids from the tokenizer "
+        "(got %r/%r) — tool-call detection will be disabled.",
+        _TOOL_CALL_START_ID, _TOOL_CALL_END_ID,
+    )
 
-def infer(audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PROMPT,
-          image: "Image.Image | None" = None) -> str:
-    # audio: float32, 16 kHz, normalized to [-1, 1] — matches Gemma 4 spec exactly
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    user_content: list[dict] = []
-    if image is not None:
-        user_content.append({"type": "image", "image": image})
-    user_content.append({"type": "audio", "audio": audio})
-    messages.append({"role": "user", "content": user_content})
+_TOOL_CALL_BODY_RE = re.compile(r"^call:(?P<name>[^{]+)\{(?P<args>.*)\}$", re.DOTALL)
+# Fallback for Gemma's own bracket argument syntax (e.g. `head_yaw:20,direction:left`)
+# when the model doesn't emit plain JSON inside the call body.
+_KV_ARG_RE = re.compile(r'(?P<key>[\w]+):(?P<value>"[^"]*"|-?\d+(?:\.\d+)?|true|false|null)')
+
+
+def to_native_tools(tools: list[dict]) -> list[dict]:
+    """Convert the app's flat OpenAI-Realtime tool specs to Chat-Completions shape."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.get("name", ""),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters") or {"type": "object", "properties": {}},
+            },
+        }
+        for tool in tools
+    ]
+
+
+def _parse_tool_call_arguments(raw: str) -> dict[str, Any]:
+    """Best-effort parse of a tool call's argument blob (JSON, or Gemma's bracket syntax)."""
+    raw = raw.strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: lenient key:value scan for Gemma's own (non-JSON) argument syntax.
+    args: dict[str, Any] = {}
+    for match in _KV_ARG_RE.finditer(raw):
+        value_text = match.group("value")
+        if value_text.startswith('"'):
+            value: Any = value_text[1:-1]
+        elif value_text in ("true", "false"):
+            value = value_text == "true"
+        elif value_text == "null":
+            value = None
+        else:
+            value = float(value_text) if "." in value_text else int(value_text)
+        args[match.group("key")] = value
+
+    if not args:
+        log.warning("[tool_call] could not parse arguments, passing through empty: %r", raw[:200])
+    return args
+
+
+def _generate_text_from_messages(messages: list[dict], tools: list[dict] | None) -> tuple[str, dict[str, Any] | None]:
+    """Run one generation pass; return (spoken_text, tool_call) — exactly one is meaningful.
+
+    tool_call, when present, is {"name": str, "arguments": dict}.
+    """
+    template_kwargs: dict[str, Any] = {}
+    if tools:
+        template_kwargs["tools"] = tools
 
     inputs = _processor.apply_chat_template(
         messages,
@@ -324,6 +398,7 @@ def infer(audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PR
         return_tensors="pt",
         return_dict=True,
         enable_thinking=False,
+        **template_kwargs,
     ).to(DEVICE)
 
     # Cast float tensors to match model dtype (bfloat16); int tensors stay as-is.
@@ -334,11 +409,10 @@ def infer(audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PR
     }
 
     input_len = inputs["input_ids"].shape[-1]
-    log.info("[infer] audio %.2fs image=%s → tokens: %d  features: %s",
-             len(audio) / SAMPLE_RATE,
-             f"{image.width}x{image.height}" if image is not None else "none",
+    log.info("[infer] → tokens: %d  features: %s  tools: %d",
              input_len,
-             tuple(inputs["input_features"].shape) if "input_features" in inputs else "none")
+             tuple(inputs["input_features"].shape) if "input_features" in inputs else "none",
+             len(tools) if tools else 0)
 
     with torch.inference_mode():
         out = _model.generate(
@@ -350,7 +424,55 @@ def infer(audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PR
             top_k=64,
         )
 
-    return _processor.decode(out[0][input_len:], skip_special_tokens=True).strip()
+    new_ids: list[int] = out[0][input_len:].tolist()
+
+    if _TOOL_CALL_TOKENS_RESOLVED and _TOOL_CALL_START_ID in new_ids:
+        start = new_ids.index(_TOOL_CALL_START_ID)
+        end = new_ids.index(_TOOL_CALL_END_ID, start + 1) if _TOOL_CALL_END_ID in new_ids[start + 1:] else len(new_ids)
+        body = _tokenizer.decode(new_ids[start + 1:end], skip_special_tokens=True).strip()
+
+        match = _TOOL_CALL_BODY_RE.match(body)
+        if match:
+            name = match.group("name").strip()
+            arguments = _parse_tool_call_arguments(match.group("args"))
+            return "", {"name": name, "arguments": arguments}
+
+        log.warning("[tool_call] <|tool_call> span found but body didn't match expected format: %r", body[:200])
+
+    return _tokenizer.decode(new_ids, skip_special_tokens=True).strip(), None
+
+
+def infer(
+    audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PROMPT,
+    image: "Image.Image | None" = None, tools: list[dict] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    # audio: float32, 16 kHz, normalized to [-1, 1] — matches Gemma 4 spec exactly
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    user_content: list[dict] = []
+    if image is not None:
+        user_content.append({"type": "image", "image": image})
+    user_content.append({"type": "audio", "audio": audio})
+    messages.append({"role": "user", "content": user_content})
+
+    log.info("[infer] audio %.2fs image=%s",
+             len(audio) / SAMPLE_RATE,
+             f"{image.width}x{image.height}" if image is not None else "none")
+    return _generate_text_from_messages(messages, tools)
+
+
+def infer_continuation(
+    history: list[dict], system_prompt: str = SYSTEM_PROMPT, tools: list[dict] | None = None,
+) -> tuple[str, dict[str, Any] | None]:
+    """Generate the next assistant turn from history alone (no new user audio).
+
+    Used after a tool result has been appended to history, to get the
+    model's spoken follow-up without waiting for new microphone input.
+    """
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    log.info("[infer_continuation] resuming from %d history turns", len(history))
+    return _generate_text_from_messages(messages, tools)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OpenAI Realtime protocol helpers
@@ -378,6 +500,16 @@ class Session:
         self._suppress_until: float = 0.0  # epoch time before which VAD commits are ignored
         self.latest_image: Image.Image | None = None  # most recent frame from app camera tool
         self._camera_ready: asyncio.Event = asyncio.Event()
+
+        # tool calling state (populated from session.update's "tools" list)
+        self.tools: list[dict] = []
+        self.tool_choice: str | None = None
+        # True once we've emitted a model-requested tool call and are waiting
+        # for the app's function_call_output + response.create round trip.
+        self._awaiting_tool_continuation: bool = False
+        # Consecutive tool calls within the current logical turn; reset when a
+        # new user utterance starts, guards against the model looping forever.
+        self._tool_chain_depth: int = 0
 
     async def send(self, kind: str, **kw: Any) -> None:
         await self.ws.send_text(_evt(kind, **kw))
@@ -421,6 +553,17 @@ class Session:
                 self.system_prompt = instructions
                 log.info("[%s] using app system prompt (%d chars)", self.id, len(instructions))
 
+            tools = cfg.get("tools")
+            if isinstance(tools, list):
+                self.tools = [t for t in tools if isinstance(t, dict) and isinstance(t.get("name"), str)]
+                self.tool_choice = cfg.get("tool_choice")
+                log.info(
+                    "[%s] tools available: %s (tool_choice=%r)",
+                    self.id,
+                    [t["name"] for t in self.tools],
+                    self.tool_choice,
+                )
+
             # Support both OpenAI flat style and HF nested style:
             #   Flat: session.input_audio_format / session.input_audio_sample_rate
             #   HF:   session.audio.input.format = {"type": "audio/pcm", "rate": null|N}
@@ -462,9 +605,20 @@ class Session:
             if utt is not None:
                 await self._enqueue(utt)
 
-        elif t in ("input_audio_buffer.commit", "response.create"):
+        elif t == "input_audio_buffer.commit":
             log.info("[%s] manual commit: %s", self.id, t)
             if not self._echo_suppressed():
+                utt = self.vad.flush()
+                if utt is not None:
+                    await self._enqueue(utt)
+
+        elif t == "response.create":
+            log.info("[%s] response.create (awaiting_tool_continuation=%s)", self.id, self._awaiting_tool_continuation)
+            if self._awaiting_tool_continuation:
+                # The app just submitted a function_call_output; generate the
+                # model's spoken follow-up from history instead of the mic.
+                asyncio.ensure_future(self._respond_to_tool_result())
+            elif not self._echo_suppressed():
                 utt = self.vad.flush()
                 if utt is not None:
                     await self._enqueue(utt)
@@ -488,7 +642,18 @@ class Session:
                         else:
                             self._camera_ready.set()
 
-            # Extract text turns (function_call_output etc.)
+            # Tool results come back as {"type": "function_call_output", "call_id": ..., "output": ...}
+            # with no "content" list, so they need explicit handling (previously silently
+            # dropped here — the model never saw non-camera tool results at all).
+            if item.get("type") == "function_call_output":
+                output = item.get("output", "")
+                call_id = item.get("call_id")
+                if output and call_id:
+                    self.history.append({"role": "tool", "tool_call_id": call_id, "content": output})
+                    self._awaiting_tool_continuation = True
+                    log.info("[%s] injected tool result (call_id=%s): %s", self.id, call_id, output[:200])
+
+            # Extract text turns (plain text conversation.item.create injections)
             text = " ".join(
                 c.get("text", "")
                 for c in content
@@ -525,6 +690,12 @@ class Session:
             await self._respond(utt)
         self._busy = False
 
+    def _native_tools(self) -> list[dict] | None:
+        """Return this session's tools in Chat-Completions shape, or None if inactive."""
+        if not self.tools or self.tool_choice == "none":
+            return None
+        return to_native_tools(self.tools)
+
     async def _respond(self, audio: np.ndarray) -> None:
         await self.send("input_audio_buffer.speech_started")
         await self.send("input_audio_buffer.speech_stopped")
@@ -534,16 +705,80 @@ class Session:
 
         t0 = time.monotonic()
         loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(
-            None, infer, audio, list(self.history), self.system_prompt, self.latest_image
+        text, tool_call = await loop.run_in_executor(
+            None, infer, audio, list(self.history), self.system_prompt, self.latest_image, self._native_tools()
         )
-        log.info("[%s] inference %.1fs → %s", self.id, time.monotonic() - t0, text[:100])
+        log.info("[%s] inference %.1fs → text=%r tool_call=%r", self.id, time.monotonic() - t0, text[:100], tool_call)
+        self._tool_chain_depth = 0  # new user utterance starts a fresh chain
+        await self._handle_generated_text(text, tool_call)
+
+    async def _respond_to_tool_result(self) -> None:
+        """Generate the model's follow-up after a tool result was appended to history."""
+        self._awaiting_tool_continuation = False
+        await self.send("response.created")
+
+        t0 = time.monotonic()
+        loop = asyncio.get_event_loop()
+        text, tool_call = await loop.run_in_executor(
+            None, infer_continuation, list(self.history), self.system_prompt, self._native_tools()
+        )
+        log.info("[%s] tool-result inference %.1fs → text=%r tool_call=%r", self.id, time.monotonic() - t0, text[:100], tool_call)
+        await self._handle_generated_text(text, tool_call)
+
+    async def _handle_generated_text(self, text: str, tool_call: dict[str, Any] | None) -> None:
+        """Route a generation result to either a tool call or a spoken reply."""
+        # Guard against the model looping on tool calls without ever replying.
+        if tool_call is not None and self._tool_chain_depth >= 3:
+            log.warning(
+                "[%s] dropping tool call after %d chained calls; forcing a spoken reply",
+                self.id, self._tool_chain_depth,
+            )
+            tool_call = None
+            text = text or "Sorry, I'm having trouble with that — could you try again?"
+
+        if tool_call is not None:
+            await self._emit_tool_call(tool_call)
+            return
 
         if not text:
             await self.send("response.audio.done")
             await self.send("response.done")
             return
 
+        await self._speak(text)
+
+    async def _emit_tool_call(self, tool_call: dict[str, Any]) -> None:
+        """Emit a function-call event for the app to execute, and await its result."""
+        name = tool_call["name"]
+        arguments = tool_call["arguments"]
+
+        call_id = f"call-{uuid.uuid4().hex[:8]}"
+        self.history.append({
+            "role": "assistant",
+            "tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+            ],
+        })
+        if len(self.history) > MAX_HISTORY_TURNS:
+            self.history = self.history[-MAX_HISTORY_TURNS:]
+
+        self._tool_chain_depth += 1
+        log.info("[%s] tool call requested: %s(%s) call_id=%s", self.id, name, arguments, call_id)
+        await self.send(
+            "response.function_call_arguments.done",
+            name=name,
+            call_id=call_id,
+            item_id=f"item-{call_id}",
+            response_id=f"resp-{call_id}",
+            output_index=0,
+            arguments=json.dumps(arguments),
+        )
+        self._awaiting_tool_continuation = True
+        await self.send("response.audio.done")
+        await self.send("response.done")
+
+    async def _speak(self, text: str) -> None:
+        """Append `text` to history, synthesize it, and stream it back as audio."""
         self.history.append({"role": "assistant", "content": text})
         if len(self.history) > MAX_HISTORY_TURNS:
             self.history = self.history[-MAX_HISTORY_TURNS:]
@@ -551,6 +786,7 @@ class Session:
         await self.send("response.output_audio_transcript.delta", delta=text)
         await self.send("response.output_audio_transcript.done", transcript=text)
 
+        loop = asyncio.get_event_loop()
         pcm = await loop.run_in_executor(None, run_tts, text)
         if pcm:
             # activate echo suppression before we start sending audio back
