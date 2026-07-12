@@ -233,6 +233,7 @@ class VADAccumulator:
     """
 
     CHUNK = 512  # Silero hard requirement: 512 samples at 16 kHz
+    PREROLL_CHUNKS = 5  # ~160ms of lookback, prepended once speech is confirmed
 
     def __init__(self, session_id: str) -> None:
         self._id = session_id
@@ -240,6 +241,13 @@ class VADAccumulator:
         self._has_speech = False
         self._silence_since: float | None = None
         self._pending: np.ndarray = np.array([], dtype=np.float32)
+        # Rolling lookback of pre-speech chunks. VAD only starts collecting once
+        # confidence crosses VAD_THRESHOLD, which is consistently a few chunks
+        # after speech actually starts (soft onsets like "Wh-"/"S-" ramp up
+        # gradually) — without this, the first word of every utterance gets its
+        # onset clipped, which is a much bigger transcription-accuracy hit than
+        # anything at the (already well-padded) tail.
+        self._preroll: list[np.ndarray] = []
 
     def push(self, pcm_bytes: bytes, src_sr: int = SAMPLE_RATE) -> np.ndarray | None:
         audio = pcm16_to_float32(pcm_bytes)
@@ -263,6 +271,11 @@ class VADAccumulator:
                 log.info("[%s][VAD] near-threshold speech detected: prob=%.3f", self._id, prob)
 
             if prob >= VAD_THRESHOLD:
+                if not self._has_speech:
+                    # Onset frame: prepend the lookback so the word's actual
+                    # start (below-threshold ramp-up) isn't lost.
+                    self._speech_frames.extend(self._preroll)
+                    self._preroll.clear()
                 self._has_speech = True
                 self._silence_since = None
                 self._speech_frames.append(chunk)
@@ -274,6 +287,10 @@ class VADAccumulator:
                 if elapsed_ms >= VAD_SILENCE_MS:
                     committed = self._commit()
                     break
+            else:
+                self._preroll.append(chunk)
+                if len(self._preroll) > self.PREROLL_CHUNKS:
+                    self._preroll.pop(0)
 
         return committed
 
@@ -284,6 +301,7 @@ class VADAccumulator:
         """Discard all buffered audio — called during echo suppression window."""
         self._speech_frames.clear()
         self._pending = np.array([], dtype=np.float32)
+        self._preroll.clear()
         self._has_speech = False
         self._silence_since = None
 
@@ -447,6 +465,51 @@ def _generate_text_from_messages(messages: list[dict], tools: list[dict] | None)
     return _tokenizer.decode(new_ids, skip_special_tokens=True).strip(), None
 
 
+_TRANSCRIBE_SYSTEM_PROMPT = (
+    "You are a transcription engine, not an assistant. You do not answer questions, "
+    "you do not chat, you do not add commentary. Your ONLY function is to output the "
+    "exact words spoken in the audio, verbatim, as plain text. Nothing else.\n\n"
+    "Example:\naudio says: \"can you play a happy song\"\noutput: can you play a happy song\n\n"
+    "Example:\naudio says: \"what's the weather like\"\noutput: what's the weather like"
+)
+_TRANSCRIBE_MAX_NEW_TOKENS = 64
+
+
+def _transcribe_audio(audio: np.ndarray) -> str:
+    """Transcribe spoken audio to text via a dedicated, tool-free generation pass.
+
+    Gemma's audio comprehension collapses when tool declarations share the prompt
+    with raw audio — verified empirically: audio+tools reliably mishears or ignores
+    the question and falls back to generic filler, while audio-alone and text+tools
+    each work correctly on their own. Isolating audio understanding into its own
+    tool-free, greedily-decoded call lets the transcript be routed through a normal
+    text+tools turn afterward, where tool-calling actually works.
+    """
+    # A short trailing pad measurably fixes last-word truncation (verified:
+    # "what is two plus two?" -> "what is two plus" without it, full sentence
+    # with it) — the model's audio encoder seems to want a little run-off room
+    # after the actual speech ends.
+    padded = np.concatenate([audio, np.zeros(int(0.4 * SAMPLE_RATE), dtype=np.float32)])
+    messages = [
+        {"role": "system", "content": _TRANSCRIBE_SYSTEM_PROMPT},
+        {"role": "user", "content": [{"type": "audio", "audio": padded}]},
+    ]
+    inputs = _processor.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=True,
+        return_tensors="pt", return_dict=True, enable_thinking=False,
+    ).to(DEVICE)
+    model_dtype = next(_model.parameters()).dtype
+    inputs = {
+        k: v.to(dtype=model_dtype) if v.is_floating_point() else v
+        for k, v in inputs.items()
+    }
+    input_len = inputs["input_ids"].shape[-1]
+    with torch.inference_mode():
+        out = _model.generate(**inputs, max_new_tokens=_TRANSCRIBE_MAX_NEW_TOKENS, do_sample=False)
+    new_ids: list[int] = out[0][input_len:].tolist()
+    return _tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+
+
 def infer(
     audio: np.ndarray, history: list[dict], system_prompt: str = SYSTEM_PROMPT,
     image: "Image.Image | None" = None, tools: list[dict] | None = None,
@@ -457,7 +520,18 @@ def infer(
     user_content: list[dict] = []
     if image is not None:
         user_content.append({"type": "image", "image": image})
-    user_content.append({"type": "audio", "audio": audio})
+
+    if tools:
+        # Tools are active for this turn — route through a transcription pass
+        # instead of handing raw audio straight to a tools-aware generation
+        # (see _transcribe_audio for why).
+        transcript = _transcribe_audio(audio)
+        log.info("[infer] transcribed for tool routing (%.2fs audio): %r",
+                 len(audio) / SAMPLE_RATE, transcript[:200])
+        user_content.append({"type": "text", "text": transcript})
+    else:
+        user_content.append({"type": "audio", "audio": audio})
+
     messages.append({"role": "user", "content": user_content})
 
     log.info("[infer] audio %.2fs image=%s",
