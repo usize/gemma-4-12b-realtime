@@ -419,8 +419,8 @@ def _generate_text_from_messages(messages: list[dict], tools: list[dict] | None)
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
             do_sample=True,
-            temperature=1.0,
-            top_p=0.95,
+            temperature=0.6,
+            top_p=0.9,
             top_k=64,
         )
 
@@ -429,7 +429,12 @@ def _generate_text_from_messages(messages: list[dict], tools: list[dict] | None)
     if _TOOL_CALL_TOKENS_RESOLVED and _TOOL_CALL_START_ID in new_ids:
         start = new_ids.index(_TOOL_CALL_START_ID)
         end = new_ids.index(_TOOL_CALL_END_ID, start + 1) if _TOOL_CALL_END_ID in new_ids[start + 1:] else len(new_ids)
-        body = _tokenizer.decode(new_ids[start + 1:end], skip_special_tokens=True).strip()
+        # skip_special_tokens=True would silently eat Gemma's `<|"|>` string-quote
+        # sentinel, making quoted and bare-word argument values indistinguishable
+        # (e.g. `emotion:<|"|>greeting<|"|>` -> `emotion:greeting`). Decode with
+        # special tokens kept, then translate the sentinel to an ASCII quote.
+        body = _tokenizer.decode(new_ids[start + 1:end], skip_special_tokens=False).strip()
+        body = body.replace('<|"|>', '"')
 
         match = _TOOL_CALL_BODY_RE.match(body)
         if match:
@@ -497,6 +502,12 @@ class Session:
         # inference state
         self._busy = False          # True while inference + TTS is running
         self._pending_utt: np.ndarray | None = None  # most recent queued utt
+        # Serializes every generate()/TTS call across both the mic-driven and
+        # tool-continuation-driven paths. Without this, a tool result arriving
+        # while a new utterance is mid-inference (or vice versa) starts a second
+        # concurrent generate() call on the same model — not thread-safe, and it
+        # makes both turns slow down and produce garbled/duplicate replies.
+        self._inference_lock: asyncio.Lock = asyncio.Lock()
         self._suppress_until: float = 0.0  # epoch time before which VAD commits are ignored
         self.latest_image: Image.Image | None = None  # most recent frame from app camera tool
         self._camera_ready: asyncio.Event = asyncio.Event()
@@ -513,25 +524,6 @@ class Session:
 
     async def send(self, kind: str, **kw: Any) -> None:
         await self.ws.send_text(_evt(kind, **kw))
-
-    async def _request_camera_frame(self, timeout: float = 0.7) -> None:
-        """Ask the app to capture a frame via the camera tool and wait for it."""
-        self._camera_ready.clear()
-        cam_id = uuid.uuid4().hex[:8]
-        await self.send(
-            "response.function_call_arguments.done",
-            name="camera",
-            call_id=f"cam-{cam_id}",
-            item_id=f"item-cam-{cam_id}",
-            response_id=f"resp-cam-{cam_id}",
-            output_index=0,
-            arguments='{"question": "What do you see right now?"}',
-        )
-        try:
-            await asyncio.wait_for(self._camera_ready.wait(), timeout=timeout)
-            log.info("[%s] camera frame ready", self.id)
-        except asyncio.TimeoutError:
-            log.info("[%s] camera probe timed out (%.1fs) — proceeding without frame", self.id, timeout)
 
     def _echo_suppressed(self) -> bool:
         return time.monotonic() < self._suppress_until
@@ -615,6 +607,10 @@ class Session:
         elif t == "response.create":
             log.info("[%s] response.create (awaiting_tool_continuation=%s)", self.id, self._awaiting_tool_continuation)
             if self._awaiting_tool_continuation:
+                # Clear the flag synchronously (before scheduling the task) so a
+                # second response.create arriving before the task actually starts
+                # running can't schedule a duplicate concurrent continuation.
+                self._awaiting_tool_continuation = False
                 # The app just submitted a function_call_output; generate the
                 # model's spoken follow-up from history instead of the mic.
                 asyncio.ensure_future(self._respond_to_tool_result())
@@ -649,9 +645,7 @@ class Session:
                 output = item.get("output", "")
                 call_id = item.get("call_id")
                 if output and call_id:
-                    self.history.append({"role": "tool", "tool_call_id": call_id, "content": output})
-                    self._awaiting_tool_continuation = True
-                    log.info("[%s] injected tool result (call_id=%s): %s", self.id, call_id, output[:200])
+                    self._inject_tool_result(call_id, output)
 
             # Extract text turns (plain text conversation.item.create injections)
             text = " ".join(
@@ -666,6 +660,43 @@ class Session:
 
         else:
             log.debug("[%s] unhandled: %s", self.id, t)
+
+    def _inject_tool_result(self, call_id: str, output: str) -> None:
+        """Insert a tool result directly after the assistant turn that requested it.
+
+        The app can run tools in the background and keep the conversation going,
+        so a second tool call may be issued (and its history entries appended)
+        before an earlier one's result comes back. Gemma's chat template assumes
+        each tool-role message immediately follows its own assistant tool_calls
+        entry — appending results in arrival order breaks that adjacency and the
+        template resolves the wrong (or no) tool name, which crashes rendering.
+        Re-homing the result next to its real call keeps history valid regardless
+        of arrival order; a call_id that no longer matches anything (e.g. evicted
+        by history trimming) is dropped rather than corrupting the next turn.
+        """
+        insert_idx = None
+        for idx in range(len(self.history) - 1, -1, -1):
+            msg = self.history[idx]
+            if msg.get("role") == "assistant" and any(
+                tc.get("id") == call_id for tc in msg.get("tool_calls") or []
+            ):
+                insert_idx = idx
+                break
+
+        if insert_idx is None:
+            log.warning("[%s] dropping tool result for unknown/expired call_id=%s", self.id, call_id)
+            return
+
+        j = insert_idx + 1
+        while j < len(self.history) and self.history[j].get("role") == "tool":
+            j += 1
+        self.history.insert(j, {"role": "tool", "tool_call_id": call_id, "content": output})
+
+        if len(self.history) > MAX_HISTORY_TURNS:
+            self.history = self.history[-MAX_HISTORY_TURNS:]
+
+        self._awaiting_tool_continuation = True
+        log.info("[%s] injected tool result (call_id=%s): %s", self.id, call_id, output[:200])
 
     async def _enqueue(self, utt: np.ndarray) -> None:
         """
@@ -701,29 +732,41 @@ class Session:
         await self.send("input_audio_buffer.speech_stopped")
         await self.send("response.created")
 
-        await self._request_camera_frame()
-
-        t0 = time.monotonic()
-        loop = asyncio.get_event_loop()
-        text, tool_call = await loop.run_in_executor(
-            None, infer, audio, list(self.history), self.system_prompt, self.latest_image, self._native_tools()
-        )
-        log.info("[%s] inference %.1fs → text=%r tool_call=%r", self.id, time.monotonic() - t0, text[:100], tool_call)
-        self._tool_chain_depth = 0  # new user utterance starts a fresh chain
-        await self._handle_generated_text(text, tool_call)
+        async with self._inference_lock:
+            t0 = time.monotonic()
+            loop = asyncio.get_event_loop()
+            try:
+                text, tool_call = await loop.run_in_executor(
+                    None, infer, audio, list(self.history), self.system_prompt, None, self._native_tools()
+                )
+            except Exception as exc:
+                await self._fail_turn("inference", exc)
+                return
+            log.info("[%s] inference %.1fs → text=%r tool_call=%r", self.id, time.monotonic() - t0, text[:100], tool_call)
+            self._tool_chain_depth = 0  # new user utterance starts a fresh chain
+            await self._handle_generated_text(text, tool_call)
 
     async def _respond_to_tool_result(self) -> None:
         """Generate the model's follow-up after a tool result was appended to history."""
-        self._awaiting_tool_continuation = False
         await self.send("response.created")
 
-        t0 = time.monotonic()
-        loop = asyncio.get_event_loop()
-        text, tool_call = await loop.run_in_executor(
-            None, infer_continuation, list(self.history), self.system_prompt, self._native_tools()
-        )
-        log.info("[%s] tool-result inference %.1fs → text=%r tool_call=%r", self.id, time.monotonic() - t0, text[:100], tool_call)
-        await self._handle_generated_text(text, tool_call)
+        async with self._inference_lock:
+            t0 = time.monotonic()
+            loop = asyncio.get_event_loop()
+            try:
+                text, tool_call = await loop.run_in_executor(
+                    None, infer_continuation, list(self.history), self.system_prompt, self._native_tools()
+                )
+            except Exception as exc:
+                await self._fail_turn("tool-result inference", exc)
+                return
+            log.info("[%s] tool-result inference %.1fs → text=%r tool_call=%r", self.id, time.monotonic() - t0, text[:100], tool_call)
+            await self._handle_generated_text(text, tool_call)
+
+    async def _fail_turn(self, context: str, exc: Exception) -> None:
+        """Log an inference failure and give the user a spoken fallback instead of going silent."""
+        log.error("[%s] %s failed: %s", self.id, context, exc, exc_info=True)
+        await self._speak("Sorry, I ran into a problem with that — could you try again?")
 
     async def _handle_generated_text(self, text: str, tool_call: dict[str, Any] | None) -> None:
         """Route a generation result to either a tool call or a spoken reply."""
